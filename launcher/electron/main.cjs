@@ -27,6 +27,7 @@ const {
 const { RuntimeHost } = require("./runtime.cjs");
 const { ensurePackagedRuntime } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
+const { requireCompleteShutdown } = require("./shutdown-result.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
 const { createUpdateController } = require("./update.cjs");
@@ -703,7 +704,8 @@ async function requestQuit() {
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
-    await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    const shutdown = await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    requireCompleteShutdown(shutdown);
     stopCatalogVerificationMonitor();
     quitting = true;
     await browserHost?.persistSession();
