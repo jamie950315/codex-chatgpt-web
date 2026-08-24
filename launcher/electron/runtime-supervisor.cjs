@@ -160,20 +160,55 @@ function managedTunnelMcpCommand(invocation) {
     .join(" ");
 }
 
-function managedTunnelConnectArgs(config, invocation) {
+function managedTunnelConnectArgs(config, invocation, credential = config.tunnel) {
   const tunnel = config.tunnel;
-  if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
+  if (!tunnel || !credential) throw new Error("launcher-owned tunnel has no runtime configuration");
   return [
     "runtimes", "connect",
-    "--alias", tunnel.alias,
-    "--profile", tunnel.profileName,
+    "--alias", credential.alias,
+    "--profile", credential.profileName || tunnel.profileName,
     "--profile-dir", tunnel.profileDir,
     "--tunnel-client-bin", tunnel.binaryPath,
-    "--tunnel-id", tunnel.tunnelId,
-    "--runtime-api-key", `file:${tunnel.runtimeKeyFile}`,
+    "--tunnel-id", credential.tunnelId,
+    "--runtime-api-key", `file:${credential.runtimeKeyFile}`,
     "--mcp-command", managedTunnelMcpCommand(invocation),
     "--json",
   ];
+}
+
+function extraTunnelCredentials(config) {
+  const rotation = config.accountRotation;
+  if (!rotation || !Array.isArray(rotation.credentials)) return [];
+  const primaryAlias = config.tunnel?.alias;
+  const primaryTunnelId = config.tunnel?.tunnelId;
+  const seen = new Set();
+  const extra = [];
+  for (const credential of rotation.credentials) {
+    if (!credential || credential.alias === primaryAlias) continue;
+    if (credential.tunnelId === primaryTunnelId) continue;
+    const key = `${credential.tunnelId}:${credential.runtimeKeyFile}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    extra.push(credential);
+  }
+  return extra;
+}
+
+function duplicateAccountTunnelAliases(config) {
+  const rotation = config.accountRotation;
+  if (!rotation || !Array.isArray(rotation.credentials) || !config.tunnel) return [];
+  const primaryAlias = config.tunnel.alias;
+  const primaryTunnelId = config.tunnel.tunnelId;
+  const seen = new Set();
+  const duplicates = [];
+  for (const credential of rotation.credentials) {
+    if (!credential?.alias || credential.alias === primaryAlias) continue;
+    if (credential.tunnelId !== primaryTunnelId) continue;
+    if (seen.has(credential.alias)) continue;
+    seen.add(credential.alias);
+    duplicates.push(credential);
+  }
+  return duplicates;
 }
 
 function validateConfig(config, descriptorPath, platform = process.platform, launcherProfile = "production") {
@@ -302,6 +337,7 @@ class RuntimeSupervisor {
     this.statePath = path.join(coreHome, "runtime", "launcher-supervisor.json");
     this.daemon = null;
     this.tunnel = null;
+    this.extraTunnelAliases = new Set();
     this.stopping = false;
     this.startPromise = null;
     this.stopPromise = null;
@@ -559,7 +595,7 @@ class RuntimeSupervisor {
     throw new Error(`Responses proxy did not become healthy on 127.0.0.1:${config.port} within ${timeoutMs}ms`);
   }
 
-  async readTunnelHealth(config) {
+  async readTunnelHealth(config, alias = config.tunnel?.alias) {
     const tunnel = config.tunnel;
     // `runtimes status` performs an optional control-plane lookup when the saved runtime key is
     // available. The cleanup dry run is the official local-only inventory and never removes
@@ -585,7 +621,7 @@ class RuntimeSupervisor {
     try {
       const parsed = JSON.parse(result.output);
       if (!Array.isArray(parsed.entries)) throw new Error("local inventory has no entries array");
-      const entry = parsed.entries.find(candidate => candidate?.alias === tunnel.alias);
+      const entry = parsed.entries.find(candidate => candidate?.alias === alias);
       if (!entry) {
         return {
           ready: false,
@@ -595,7 +631,7 @@ class RuntimeSupervisor {
           healthy: false,
           absent: true,
           statusKnown: true,
-          detail: `alias=${tunnel.alias}; local_inventory=absent`,
+          detail: `alias=${alias}; local_inventory=absent`,
         };
       }
       const runtimeState = entry.runtime_state;
@@ -809,6 +845,7 @@ class RuntimeSupervisor {
     if (config.mode !== "full") return;
     this.assertTunnelClientReady(config);
     try {
+      await this.stopDuplicateAccountTunnels(config);
       const existing = await this.waitForKnownTunnelStatus(config);
       if (existing.ready) {
         this.tunnel = {
@@ -817,6 +854,7 @@ class RuntimeSupervisor {
           signalCode: null,
           managed: true,
         };
+        await this.connectExtraAccountTunnels(config);
         this.startTunnelMonitor(config);
         this.logger.info("runtime.tunnel_adopted", { pid: existing.pid });
         return;
@@ -838,6 +876,7 @@ class RuntimeSupervisor {
       }
       await this.waitForTunnel(config, TUNNEL_START_TIMEOUT_MS, operationName);
       if (!this.tunnel) throw new Error("Tunnel runtime became ready without a managed process identity");
+      await this.connectExtraAccountTunnels(config);
       this.startTunnelMonitor(config);
     } catch (error) {
       let cleanupError;
@@ -872,6 +911,104 @@ class RuntimeSupervisor {
     );
   }
 
+  async stopDuplicateAccountTunnels(config) {
+    for (const credential of duplicateAccountTunnelAliases(config)) {
+      const stopped = await this.runTunnelStopCommand(config, credential.alias);
+      if (stopped.code !== 0 && !tunnelRuntimeAbsent(stopped.output)) {
+        this.logger.warn("runtime.duplicate_tunnel_stop_failed", {
+          alias: credential.alias,
+          message: stopped.output?.slice?.(0, 500) || `exit ${stopped.code}`,
+        });
+      } else {
+        this.logger.info("runtime.duplicate_tunnel_stopped", { alias: credential.alias });
+      }
+    }
+  }
+
+  async connectExtraAccountTunnels(config) {
+    await this.syncExtraAccountTunnels(config, { reconnectTracked: true });
+  }
+
+  async stopExtraAccountTunnel(config, alias, timeoutMs = 10_000) {
+    const stopped = await this.runTunnelStopCommand(config, alias);
+    if (stopped.code !== 0 && !tunnelRuntimeAbsent(stopped.output)) {
+      throw new Error(`extra tunnel ${alias} refused shutdown: ${tunnelControlDiagnostic(stopped)}`);
+    }
+    if (stopped.code === 0) await this.waitForTunnelStopped(config, timeoutMs, alias);
+    this.extraTunnelAliases.delete(alias);
+    this.logger.info("runtime.extra_tunnel_stopped", { alias });
+  }
+
+  async stopExtraAccountTunnels(config, aliases = [...this.extraTunnelAliases]) {
+    const failures = [];
+    for (const alias of aliases) {
+      try {
+        await this.stopExtraAccountTunnel(config, alias);
+      } catch (error) {
+        failures.push(errorMessage(error));
+      }
+    }
+    if (failures.length > 0) throw new Error(failures.join("; "));
+  }
+
+  async syncExtraAccountTunnels(config, { reconnectTracked = false } = {}) {
+    const credentials = extraTunnelCredentials(config);
+    const desiredAliases = new Set(credentials.map((credential) => credential.alias));
+    const retired = [...this.extraTunnelAliases].filter((alias) => !desiredAliases.has(alias));
+    await this.stopExtraAccountTunnels(config, retired);
+    const invocation = this.runtimeCommand(["mcp", "--broker-socket", config.brokerSocketPath]);
+    const connectedNow = [];
+    try {
+      for (const credential of credentials) {
+        if (!reconnectTracked && this.extraTunnelAliases.has(credential.alias)) continue;
+        const connected = await this.runTunnelCommand(
+          config,
+          managedTunnelConnectArgs(config, invocation, credential),
+          TUNNEL_START_TIMEOUT_MS,
+          "Tunnel extra account startup",
+        );
+        if (connected.code !== 0) {
+          throw new Error(
+            `Extra tunnel ${credential.alias} failed to connect: ${tunnelControlDiagnostic(connected)}`,
+          );
+        }
+        if (!this.extraTunnelAliases.has(credential.alias)) connectedNow.push(credential.alias);
+        this.extraTunnelAliases.add(credential.alias);
+        this.logger.info("runtime.extra_tunnel_connected", { alias: credential.alias });
+      }
+    } catch (error) {
+      let cleanupError;
+      try {
+        await this.stopExtraAccountTunnels(config, connectedNow);
+      } catch (caught) {
+        cleanupError = caught;
+      }
+      if (cleanupError) {
+        throw new Error(appendFailure(errorMessage(error), "extra tunnel startup cleanup failed", cleanupError));
+      }
+      throw error;
+    }
+  }
+
+  async observeTunnelFleetForMonitor(config) {
+    let current = config;
+    try { current = this.readConfig?.() || config; } catch {}
+    await this.syncExtraAccountTunnels(current);
+    const primary = await this.observeTunnelForMonitor(current);
+    if (!primary.ready) return primary;
+    for (const credential of extraTunnelCredentials(current)) {
+      const health = await this.readTunnelHealth(current, credential.alias);
+      if (!health.ready) {
+        return {
+          ready: false,
+          statusKnown: health.statusKnown,
+          detail: `Extra tunnel ${credential.alias} lost readiness: ${health.detail}`,
+        };
+      }
+    }
+    return primary;
+  }
+
   startTunnelMonitor(config) {
     this.stopTunnelMonitor();
     this.tunnelMonitorFailures = 0;
@@ -898,7 +1035,7 @@ class RuntimeSupervisor {
         || this.tunnelMonitorInFlight
         || this.restartTimers.tunnel) return;
       this.tunnelMonitorInFlight = true;
-      void this.observeTunnelForMonitor(config).then((health) => {
+      void this.observeTunnelFleetForMonitor(config).then((health) => {
         if (this.stopping || generation !== this.tunnelMonitorGeneration) return;
         if (!health.statusKnown) {
           if (!this.tunnelMonitorObservationUnavailable) {
@@ -1291,11 +1428,11 @@ class RuntimeSupervisor {
     if (processRunning(pid)) throw new Error(`${name} process ${pid} did not stop within ${timeoutMs}ms`);
   }
 
-  async waitForTunnelStopped(config, timeoutMs = 10_000) {
+  async waitForTunnelStopped(config, timeoutMs = 10_000, alias = config.tunnel?.alias) {
     const deadline = Date.now() + timeoutMs;
     let lastDetail = "tunnel stop status has not been observed";
     while (Date.now() < deadline) {
-      const health = await this.readTunnelHealth(config);
+      const health = await this.readTunnelHealth(config, alias);
       if (tunnelRuntimeStopped(health)) {
         return health;
       }
@@ -1344,14 +1481,19 @@ class RuntimeSupervisor {
 
   async stopTunnelGracefully(config, timeoutMs = 10_000) {
     const managed = this.tunnel;
+    this.stopTunnelMonitor();
+    try {
+      await this.stopExtraAccountTunnels(config);
+    } catch (error) {
+      this.startTunnelMonitor(config);
+      throw error;
+    }
     if (!managed) {
-      this.stopTunnelMonitor();
       this.tunnel = null;
       return;
     }
     const tunnel = config.tunnel;
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
-    this.stopTunnelMonitor();
     let result;
     try {
       result = await this.runTunnelStopCommand(config);
@@ -1397,12 +1539,15 @@ class RuntimeSupervisor {
     });
   }
 
-  async runTunnelStopCommand(config) {
+  async runTunnelStopCommand(config, alias = config.tunnel?.alias) {
     const tunnel = config.tunnel;
     if (!tunnel) throw new Error("launcher-owned tunnel has no runtime configuration");
+    if (typeof alias !== "string" || !alias.trim()) {
+      throw new Error("launcher-owned tunnel has no runtime alias");
+    }
     return await this.runTunnelCommand(
       config,
-      ["runtimes", "stop", tunnel.alias, "--json"],
+      ["runtimes", "stop", alias, "--json"],
       10_000,
       "Tunnel shutdown",
     );
@@ -1773,7 +1918,7 @@ class RuntimeSupervisor {
         && (runtimeMayBeLive || !ownershipState)) {
         await this.adoptConfiguredTunnelForStop(config);
       }
-      if (!this.daemon && !this.tunnel) {
+      if (!this.daemon && !this.tunnel && this.extraTunnelAliases.size === 0) {
         if (!config) {
           if (ownershipState && (
             processRunning(ownershipState.daemonPid)
@@ -1798,7 +1943,7 @@ class RuntimeSupervisor {
         }
         drained = await this.acquireDrain(config);
       }
-      if (this.tunnel) {
+      if (this.tunnel || this.extraTunnelAliases.size > 0) {
         if (!config) throw new Error("launcher-owned tunnel cannot be stopped without a valid configuration");
         await this.stopTunnelGracefully(config);
         tunnelStopped = true;
@@ -1864,9 +2009,24 @@ class RuntimeSupervisor {
     try {
       if (this.recoveryTasks.size > 0) await Promise.allSettled([...this.recoveryTasks]);
       const failures = [];
+      let config;
+      if (this.tunnel || this.extraTunnelAliases.size > 0) {
+        try {
+          config = this.readConfig();
+          if (!config) throw new Error("runtime configuration is unavailable");
+        } catch (error) {
+          failures.push(`configuration: ${errorMessage(error)}`);
+        }
+      }
+      if (config && this.extraTunnelAliases.size > 0) {
+        try {
+          await this.stopExtraAccountTunnels(config);
+        } catch (error) {
+          failures.push(`extra tunnels: ${errorMessage(error)}`);
+        }
+      }
       if (this.tunnel) {
         try {
-          const config = this.readConfig();
           if (!config) throw new Error("runtime configuration is unavailable");
           const stopped = await this.runTunnelStopCommand(config);
           if (stopped.code !== 0) throw new Error(tunnelControlDiagnostic(stopped));
@@ -1917,5 +2077,7 @@ module.exports = {
   TUNNEL_START_TIMEOUT_MS,
   RuntimeSupervisor,
   managedTunnelConnectArgs,
+  extraTunnelCredentials,
+  duplicateAccountTunnelAliases,
   validateConfig,
 };

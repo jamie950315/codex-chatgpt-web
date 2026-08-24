@@ -434,6 +434,34 @@ test("mutating launcher operations are serialized before lifecycle changes begin
   assert.equal(fixture.invocation(), undefined);
 });
 
+test("runtime CLI operations queue instead of rejecting overlapping account writes", async () => {
+  const fixture = hostFor(null);
+  const order = [];
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  fixture.host.executeRun = async (name) => {
+    order.push(`start:${name}`);
+    if (name === "accounts-update-identity") await firstGate;
+    order.push(`end:${name}`);
+    return { code: 0, stdout: "{}", stderr: "" };
+  };
+  const first = fixture.host.run("accounts-update-identity", ["accounts", "update-identity"]);
+  const second = fixture.host.run("accounts-validate", ["accounts", "validate"]);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(order, ["start:accounts-update-identity"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(order, [
+    "start:accounts-update-identity",
+    "end:accounts-update-identity",
+    "start:accounts-validate",
+    "end:accounts-validate",
+  ]);
+});
+
 function bridgeFixture({ active }) {
   const calls = [];
   let routeActive = active;

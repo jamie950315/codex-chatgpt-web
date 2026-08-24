@@ -5,6 +5,7 @@ import { unzipSync } from "fflate";
 import type { AppConfig, TunnelConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
+import { PRIMARY_CREDENTIAL_ID, rotationFromConfig, uniqueCredentials } from "./account-rotation";
 
 const TUNNEL_VERSION = "0.0.10";
 const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
@@ -197,7 +198,29 @@ function tunnel(config: AppConfig): TunnelConfig {
 }
 
 export function connectTunnel(config: AppConfig): void {
-  const settings = tunnel(config);
+  connectOneTunnel(config, tunnel(config));
+}
+
+export function connectConfiguredTunnels(config: AppConfig): void {
+  connectTunnel(config);
+  if (config.mode !== "full" || !config.tunnel) return;
+  const primaryTunnelId = config.tunnel.tunnelId;
+  const primaryAlias = config.tunnel.alias;
+  for (const credential of uniqueCredentials(rotationFromConfig(config))) {
+    if (credential.id === PRIMARY_CREDENTIAL_ID) continue;
+    if (credential.alias === primaryAlias) continue;
+    if (credential.tunnelId === primaryTunnelId) continue;
+    connectOneTunnel(config, {
+      ...config.tunnel,
+      tunnelId: credential.tunnelId,
+      runtimeKeyFile: credential.runtimeKeyFile,
+      alias: credential.alias,
+      profileName: credential.profileName,
+    });
+  }
+}
+
+function connectOneTunnel(config: AppConfig, settings: TunnelConfig): void {
   mkdirSync(settings.profileDir, { recursive: true, mode: 0o700 });
   const result = runCommand(settings.binaryPath, [
     "runtimes", "connect",
@@ -347,17 +370,21 @@ export function parseTunnelStatus(output: string, exitStatus = 0): TunnelRuntime
   }
 }
 
-export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
+export function tunnelStatusForAlias(config: AppConfig, alias: string): TunnelRuntimeStatus {
   const settings = tunnel(config);
   if (!existsSync(settings.binaryPath)) {
     return { ok: false, processRunning: false, healthy: false, ready: false, detail: `Missing ${settings.binaryPath}` };
   }
   const result = runCommand(
     settings.binaryPath,
-    ["runtimes", "status", settings.alias, "--json"],
+    ["runtimes", "status", alias, "--json"],
     { timeout: 10_000 },
   );
   return parseTunnelStatus(tunnelCommandOutput(result), result.status);
+}
+
+export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
+  return tunnelStatusForAlias(config, tunnel(config).alias);
 }
 
 export async function waitForTunnelReady(

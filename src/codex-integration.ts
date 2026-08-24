@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import type { AppConfig } from "./config";
-import { atomicWriteFile, getConfigPath, saveConfig } from "./config";
+import { atomicWriteFile, getConfigPath, saveConfigPreservingAccountRotation } from "./config";
 import {
   getCodexConfigPath,
   getCodexJournalPath,
@@ -118,7 +118,7 @@ export function setCodexSubagentProtocol(
   ].map(snapshotFile);
   try {
     const journal = installCodexIntegration(nextConfig);
-    saveConfig(nextConfig);
+    saveConfigPreservingAccountRotation(nextConfig);
     return journal;
   } catch (error) {
     const rollbackFailures: string[] = [];

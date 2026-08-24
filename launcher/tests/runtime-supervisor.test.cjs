@@ -12,6 +12,8 @@ const {
   MAX_RESTARTS_PER_WINDOW,
   RuntimeSupervisor,
   managedTunnelConnectArgs,
+  extraTunnelCredentials,
+  duplicateAccountTunnelAliases,
   validateConfig,
 } = require("../electron/runtime-supervisor.cjs");
 
@@ -290,6 +292,218 @@ test("launcher delegates long-lived tunnel supervision to native runtimes connec
     () => managedTunnelConnectArgs(config),
     /requires an explicit runtime invocation/,
   );
+});
+
+test("extra tunnels skip credentials that share the primary tunnel id", () => {
+  const config = {
+    tunnel: {
+      alias: "codex-chatgpt-web",
+      tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      runtimeKeyFile: "/tmp/primary.key",
+    },
+    accountRotation: {
+      credentials: [
+        {
+          id: "cred_icloud",
+          alias: "codex-chatgpt-web-cred_icloud",
+          tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          runtimeKeyFile: "/tmp/icloud.key",
+        },
+        {
+          id: "cred_other",
+          alias: "codex-chatgpt-web-cred_other",
+          tunnelId: "tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          runtimeKeyFile: "/tmp/other.key",
+        },
+      ],
+    },
+  };
+  assert.deepEqual(extraTunnelCredentials(config).map((credential) => credential.id), ["cred_other"]);
+  assert.deepEqual(duplicateAccountTunnelAliases(config).map((credential) => credential.alias), [
+    "codex-chatgpt-web-cred_icloud",
+  ]);
+});
+
+function extraTunnelLifecycleConfig(credentials = []) {
+  return {
+    mode: "full",
+    brokerSocketPath: "/tmp/codex-web-gpt.sock",
+    tunnel: {
+      alias: "codex-chatgpt-web",
+      tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      runtimeKeyFile: "/tmp/primary.key",
+      binaryPath: "/tmp/tunnel-client",
+      profileDir: "/tmp/tunnel-profiles",
+      profileName: "codex-chatgpt-web",
+    },
+    accountRotation: { credentials },
+  };
+}
+
+const extraCredentialOne = {
+  id: "cred_one",
+  alias: "codex-chatgpt-web-cred_one",
+  tunnelId: "tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  runtimeKeyFile: "/tmp/one.key",
+};
+
+const extraCredentialTwo = {
+  id: "cred_two",
+  alias: "codex-chatgpt-web-cred_two",
+  tunnelId: "tunnel_cccccccccccccccccccccccccccccccc",
+  runtimeKeyFile: "/tmp/two.key",
+};
+
+test("extra tunnel startup fails closed and cleans aliases connected earlier in the transaction", async () => {
+  const commands = [];
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    extraTunnelAliases: new Set(),
+    logger: { info() {}, warn() {} },
+    runtimeCommand: () => ({ executable: "/runtime/bun", args: ["cli.js", "mcp"] }),
+    runTunnelCommand: async (_config, args) => {
+      commands.push(args);
+      if (args[0] === "runtimes" && args[1] === "connect") {
+        const alias = args[args.indexOf("--alias") + 1];
+        return { code: alias === extraCredentialTwo.alias ? 1 : 0, output: "connect failed" };
+      }
+      return { code: 0, output: "stopped" };
+    },
+    waitForTunnelStopped: async () => {},
+  });
+
+  await assert.rejects(
+    supervisor.connectExtraAccountTunnels(extraTunnelLifecycleConfig([
+      extraCredentialOne,
+      extraCredentialTwo,
+    ])),
+    /extra tunnel.*cred_two/i,
+  );
+  assert.deepEqual(
+    commands.filter((args) => args[1] === "stop").map((args) => args[2]),
+    [extraCredentialOne.alias],
+  );
+  assert.deepEqual([...supervisor.extraTunnelAliases], []);
+});
+
+test("extra tunnel config refresh stops aliases that are no longer configured", async () => {
+  const stopped = [];
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    extraTunnelAliases: new Set([extraCredentialOne.alias, extraCredentialTwo.alias]),
+    logger: { info() {}, warn() {} },
+    runtimeCommand: () => ({ executable: "/runtime/bun", args: ["cli.js", "mcp"] }),
+    runTunnelStopCommand: async (_config, alias) => {
+      stopped.push(alias);
+      return { code: 0, output: "stopped" };
+    },
+    waitForTunnelStopped: async () => {},
+  });
+
+  await supervisor.syncExtraAccountTunnels(extraTunnelLifecycleConfig([extraCredentialTwo]));
+
+  assert.deepEqual(stopped, [extraCredentialOne.alias]);
+  assert.deepEqual([...supervisor.extraTunnelAliases], [extraCredentialTwo.alias]);
+});
+
+test("extra tunnel fleet health fails when any configured alias loses readiness", async () => {
+  const config = extraTunnelLifecycleConfig([extraCredentialOne]);
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    extraTunnelAliases: new Set([extraCredentialOne.alias]),
+    readConfig: () => config,
+    syncExtraAccountTunnels: async () => {},
+    observeTunnelForMonitor: async () => ({ ready: true, statusKnown: true, detail: "primary ready" }),
+    readTunnelHealth: async (_config, alias) => alias === extraCredentialOne.alias
+      ? { ready: false, statusKnown: true, detail: "extra stopped" }
+      : { ready: true, statusKnown: true, detail: "primary ready" },
+  });
+
+  assert.deepEqual(await supervisor.observeTunnelFleetForMonitor(config), {
+    ready: false,
+    statusKnown: true,
+    detail: `Extra tunnel ${extraCredentialOne.alias} lost readiness: extra stopped`,
+  });
+});
+
+test("graceful tunnel shutdown stops every tracked extra alias before primary", async () => {
+  const stopped = [];
+  const config = extraTunnelLifecycleConfig([extraCredentialOne, extraCredentialTwo]);
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    logger: { info() {} },
+    tunnel: { pid: 123, exitCode: null, signalCode: null, managed: true },
+    extraTunnelAliases: new Set([extraCredentialOne.alias, extraCredentialTwo.alias]),
+    stopTunnelMonitor() {},
+    startTunnelMonitor() {},
+    runTunnelStopCommand: async (_config, alias = config.tunnel.alias) => {
+      stopped.push(alias);
+      return { code: 0, output: "stopped" };
+    },
+    waitForTunnelStopped: async () => {},
+  });
+
+  await supervisor.stopTunnelGracefully(config);
+
+  assert.deepEqual(stopped, [extraCredentialOne.alias, extraCredentialTwo.alias, config.tunnel.alias]);
+  assert.deepEqual([...supervisor.extraTunnelAliases], []);
+});
+
+test("launcher shutdown does not skip tracked extras when primary ownership is between states", async () => {
+  const config = extraTunnelLifecycleConfig([extraCredentialOne]);
+  let tunnelStops = 0;
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    logger: { warn() {} },
+    stopPromise: null,
+    startPromise: null,
+    stopping: false,
+    tunnel: null,
+    daemon: null,
+    extraTunnelAliases: new Set([extraCredentialOne.alias]),
+    restartTimers: { daemon: null, tunnel: null },
+    recoveryTasks: new Set(),
+    launcherProfile: "production",
+    readConfig: () => config,
+    readState: () => null,
+    proxyHealth: async () => false,
+    stopTunnelMonitor() {},
+    adoptConfiguredTunnelForStop: async () => {},
+    stopTunnelGracefully: async () => {
+      tunnelStops += 1;
+      supervisor.extraTunnelAliases.clear();
+    },
+    clearState() {},
+  });
+
+  assert.deepEqual(await supervisor.stopForSetup(), { status: "stopped" });
+  assert.equal(tunnelStops, 1);
+  assert.deepEqual([...supervisor.extraTunnelAliases], []);
+});
+
+test("forced shutdown stops tracked extra aliases even when primary cleanup is forced", async () => {
+  const stopped = [];
+  const config = extraTunnelLifecycleConfig([extraCredentialOne]);
+  const supervisor = Object.assign(Object.create(RuntimeSupervisor.prototype), {
+    logger: { info() {}, warn() {} },
+    stopping: false,
+    tunnel: { pid: 123, exitCode: null, signalCode: null, managed: true },
+    daemon: null,
+    extraTunnelAliases: new Set([extraCredentialOne.alias]),
+    restartTimers: { daemon: null, tunnel: null },
+    recoveryTasks: new Set(),
+    stopTunnelMonitor() {},
+    readConfig: () => config,
+    runTunnelStopCommand: async (_config, alias = config.tunnel.alias) => {
+      stopped.push(alias);
+      return { code: 0, output: "stopped" };
+    },
+    waitForTunnelStopped: async () => {},
+    stopChild: async () => {},
+    clearState() {},
+    tryWriteState() {},
+  });
+
+  const result = await supervisor.forceStopOwnedRuntime(new Error("forced"));
+
+  assert.equal(result.status, "forced");
+  assert.deepEqual(stopped, [extraCredentialOne.alias, config.tunnel.alias]);
+  assert.deepEqual([...supervisor.extraTunnelAliases], []);
 });
 
 test("launcher repairs its runtime before building the tunnel MCP command", async () => {

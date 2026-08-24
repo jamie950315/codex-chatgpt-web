@@ -11,11 +11,162 @@ const {
   shellZoomActionForInput,
 } = require("../electron/browser-state.cjs");
 const {
+  accountIdentityUpdate,
   allowedAuthUrl,
   BrowserHost,
+  createSerialTaskQueue,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
+  reconcileAccountValidationReport,
 } = require("../electron/browser-host.cjs");
+
+const listedAccountsFixture = {
+  accounts: [{
+    id: "account_primary",
+    name: "Primary",
+    email: "owner@example.com",
+    credentialId: "primary",
+    workspaces: [{
+      id: "primary",
+      name: "Personal",
+      partition: "persist:codex-web-gpt-chatgpt",
+      credentialId: "primary",
+    }, {
+      id: "slot_team",
+      name: "Team",
+      partition: "persist:codex-web-gpt-chatgpt-slot_team",
+      credentialId: "primary",
+    }],
+  }],
+};
+
+const staticAccountReportFixture = {
+  ok: true,
+  accounts: [{
+    id: "account_primary",
+    name: "Primary",
+    email: "owner@example.com",
+    tunnel: { status: "ok", message: "Tunnel is ready" },
+    workspaces: [{
+      id: "primary",
+      name: "Personal",
+      login: { status: "ok", message: "Stored session is signed in" },
+    }, {
+      id: "slot_team",
+      name: "Team",
+      login: { status: "ok", message: "Stored session is signed in" },
+    }],
+  }],
+};
+
+test("account validation report reconciliation accepts exact account and workspace coverage", () => {
+  assert.deepEqual(
+    reconcileAccountValidationReport(listedAccountsFixture, staticAccountReportFixture),
+    staticAccountReportFixture,
+  );
+});
+
+test("account validation report reconciliation rejects malformed and incomplete reports", () => {
+  const cases = [{
+    name: "missing accounts array",
+    report: { ok: true },
+  }, {
+    name: "empty accounts array",
+    report: { ok: true, accounts: [] },
+  }, {
+    name: "missing configured account",
+    listed: {
+      accounts: [
+        listedAccountsFixture.accounts[0],
+        {
+          id: "account_other",
+          name: "Other",
+          credentialId: "other",
+          workspaces: [{
+            id: "slot_other",
+            name: "Other workspace",
+            partition: "persist:codex-web-gpt-chatgpt-slot_other",
+            credentialId: "other",
+          }],
+        },
+      ],
+    },
+    report: staticAccountReportFixture,
+  }, {
+    name: "missing configured workspace",
+    report: {
+      ...staticAccountReportFixture,
+      accounts: [{
+        ...staticAccountReportFixture.accounts[0],
+        workspaces: [staticAccountReportFixture.accounts[0].workspaces[0]],
+      }],
+    },
+  }, {
+    name: "malformed tunnel check",
+    report: {
+      ...staticAccountReportFixture,
+      accounts: [{ ...staticAccountReportFixture.accounts[0], tunnel: { status: "ok" } }],
+    },
+  }];
+
+  for (const { name, listed = listedAccountsFixture, report } of cases) {
+    assert.throws(
+      () => reconcileAccountValidationReport(listed, report),
+      /validation report/i,
+      name,
+    );
+  }
+});
+
+test("captured identity evidence always persists the workspace as signed in", () => {
+  assert.deepEqual(accountIdentityUpdate("slot_email", { email: "owner@example.com" }), {
+    slotId: "slot_email",
+    email: "owner@example.com",
+    workspaceName: undefined,
+    signedIn: true,
+  });
+  assert.deepEqual(accountIdentityUpdate("slot_workspace", { workspaceName: "Team" }), {
+    slotId: "slot_workspace",
+    email: undefined,
+    workspaceName: "Team",
+    signedIn: true,
+  });
+  assert.equal(accountIdentityUpdate("slot_empty", {}), null);
+});
+
+test("serial task queue orders overlapping captures and wait includes the full queue", async () => {
+  const queue = createSerialTaskQueue();
+  const order = [];
+  let releaseFirst;
+  let releaseSecond;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  const secondGate = new Promise((resolve) => { releaseSecond = resolve; });
+  const first = queue.enqueue(async () => {
+    order.push("first:start");
+    await firstGate;
+    order.push("first:end");
+  });
+  const second = queue.enqueue(async () => {
+    order.push("second:start");
+    await secondGate;
+    order.push("second:end");
+  });
+  let validationStarted = false;
+  const validation = queue.wait().then(() => { validationStarted = true; });
+
+  await Promise.resolve();
+  assert.deepEqual(order, ["first:start"]);
+  assert.equal(validationStarted, false);
+  releaseFirst();
+  await first;
+  await Promise.resolve();
+  assert.deepEqual(order, ["first:start", "first:end", "second:start"]);
+  assert.equal(validationStarted, false);
+  releaseSecond();
+  await Promise.all([second, validation]);
+  assert.deepEqual(order, ["first:start", "first:end", "second:start", "second:end"]);
+  assert.equal(validationStarted, true);
+});
 
 test("only an explicit Cloudflare challenge on a ChatGPT backend response triggers recovery", () => {
   assert.equal(isChatGptCloudflareChallengeResponse({
@@ -371,6 +522,197 @@ test("authentication windows stay inside the launcher-owned browser partition", 
   assert.doesNotMatch(source, /loginWithSystemBrowser|captureSystemBrowserLogin|system_login_started/);
 });
 
+test("extra-partition workspace logins do not take the global login lock", async () => {
+  const host = {
+    extraLoginOperations: new Map(),
+    loginPartition: null,
+    partition: "persist:codex-web-gpt-chatgpt",
+    state: { authenticated: true },
+    show() {},
+    syncViewVisibility() {},
+    ready: async () => {},
+    runExtraPartitionLogin: async (nextPartition) => ({ partition: nextPartition }),
+  };
+  const first = BrowserHost.prototype.openLogin.call(host, "persist:slot-us");
+  const second = BrowserHost.prototype.openLogin.call(host, "persist:slot-uk");
+  assert.notEqual(first, second);
+  assert.deepEqual(await Promise.all([first, second]), [
+    { partition: "persist:slot-us" },
+    { partition: "persist:slot-uk" },
+  ]);
+});
+
+test("extra-partition login overlay hides when the browser surface is inactive", () => {
+  const calls = [];
+  const loginView = {
+    webContents: { isDestroyed: () => false },
+    setVisible(value) { calls.push(["setVisible", value]); },
+    setBounds(bounds) { calls.push(["setBounds", bounds]); },
+  };
+  const fixture = {
+    visible: true,
+    surfaceActive: false,
+    boundsReady: true,
+    bounds: { x: 12, y: 48, width: 800, height: 600 },
+    authView: null,
+    loginPartition: "persist:codex-web-gpt-chatgpt-slot_x",
+    keepaliveViews: new Map([["persist:codex-web-gpt-chatgpt-slot_x", loginView]]),
+    turnTabs: new Map(),
+    selectedTurnTab() { return null; },
+    view: { setVisible() {} },
+    hideKeepaliveView: BrowserHost.prototype.hideKeepaliveView,
+  };
+  BrowserHost.prototype.syncViewVisibility.call(fixture);
+  assert.equal(calls.some((call) => call[0] === "setVisible" && call[1] === true), false);
+  assert.deepEqual(calls.at(-2), ["setVisible", false]);
+  assert.deepEqual(calls.at(-1), ["setBounds", { x: 0, y: 0, width: 1, height: 1 }]);
+});
+
+test("account keepalive sync clears and closes a retired secondary partition", async () => {
+  const calls = [];
+  const retired = {
+    webContents: {
+      isDestroyed: () => false,
+      session: {
+        clearStorageData: async () => calls.push("clear:retired"),
+      },
+      close: () => calls.push("close:retired"),
+    },
+    setVisible: () => {},
+    setBounds: () => {},
+  };
+  const keepaliveTimer = setInterval(() => {}, 60_000);
+  keepaliveTimer.unref?.();
+  const fixture = {
+    partition: "persist:codex-web-gpt-chatgpt",
+    keepaliveViews: new Map([
+      ["persist:codex-web-gpt-chatgpt-slot_retired", retired],
+    ]),
+    keepaliveTimer,
+    window: {
+      contentView: {
+        removeChildView: (view) => calls.push(view === retired ? "detach:retired" : "detach:other"),
+      },
+    },
+    logger: { warn: () => {} },
+    ensureKeepalivePartition: BrowserHost.prototype.ensureKeepalivePartition,
+  };
+
+  await BrowserHost.prototype.syncAccountKeepalives.call(fixture, []);
+
+  assert.deepEqual(calls, ["clear:retired", "detach:retired", "close:retired"]);
+  assert.equal(fixture.keepaliveViews.size, 0);
+  assert.equal(fixture.keepaliveTimer, null);
+});
+
+test("account keepalive sync preserves wanted secondary and primary sessions", async () => {
+  const calls = [];
+  const retained = {
+    webContents: {
+      isDestroyed: () => false,
+      session: { clearStorageData: async () => calls.push("clear:retained") },
+      close: () => calls.push("close:retained"),
+      loadURL: async () => {},
+    },
+    setVisible: () => {},
+    setBounds: () => {},
+  };
+  const fixture = {
+    partition: "persist:codex-web-gpt-chatgpt",
+    view: {
+      webContents: {
+        session: { clearStorageData: async () => calls.push("clear:primary") },
+      },
+    },
+    keepaliveViews: new Map([
+      ["persist:codex-web-gpt-chatgpt-slot_retained", retained],
+    ]),
+    keepaliveTimer: null,
+    window: { contentView: { removeChildView: () => calls.push("detach") } },
+    ensureKeepalivePartition: BrowserHost.prototype.ensureKeepalivePartition,
+  };
+
+  await BrowserHost.prototype.syncAccountKeepalives.call(fixture, [
+    "persist:codex-web-gpt-chatgpt",
+    "persist:codex-web-gpt-chatgpt-slot_retained",
+  ]);
+
+  assert.deepEqual(calls, []);
+  assert.deepEqual([...fixture.keepaliveViews.keys()], [
+    "persist:codex-web-gpt-chatgpt-slot_retained",
+  ]);
+  if (fixture.keepaliveTimer) clearInterval(fixture.keepaliveTimer);
+});
+
+test("extra-partition login rejects a signed-out ChatGPT landing page", async () => {
+  const calls = [];
+  const originalNow = Date.now;
+  let now = 0;
+  Date.now = () => {
+    now += 100_000;
+    return now;
+  };
+  const view = {
+    webContents: {
+      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+      loadURL: async () => {},
+      executeJavaScript: async () => ({
+        composer: false,
+        temporary: true,
+        sessionAuthenticated: false,
+        readyState: "complete",
+      }),
+    },
+  };
+  const fixture = {
+    loginPartition: null,
+    show() {},
+    logger: { info() {} },
+    ensureKeepalivePartition: () => view,
+    syncViewVisibility() {},
+    readChatGptIdentity: async () => ({ email: "wrong@example.com" }),
+    snapshot: () => ({ authenticated: false }),
+  };
+
+  try {
+    await assert.rejects(
+      BrowserHost.prototype.runExtraPartitionLogin.call(fixture, "persist:slot-signed-out", {
+        onSignedIn: async () => calls.push("signed-in"),
+      }),
+      /login was not completed/,
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+  assert.deepEqual(calls, []);
+});
+
+test("extra-partition validation rejects a landing page without primary authentication evidence", async () => {
+  const contents = {
+    isDestroyed: () => false,
+    getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    executeJavaScript: async () => ({
+      composer: false,
+      temporary: true,
+      sessionAuthenticated: false,
+      readyState: "complete",
+    }),
+  };
+  const fixture = {
+    partition: "persist:codex-web-gpt-chatgpt",
+    view: { webContents: contents },
+    ensureKeepalivePartition: () => ({ webContents: contents }),
+  };
+
+  assert.deepEqual(
+    await BrowserHost.prototype.probePartitionLogin.call(
+      fixture,
+      "persist:codex-web-gpt-chatgpt-slot_signed_out",
+    ),
+    { status: "error", message: "Not signed in to ChatGPT on this workspace" },
+  );
+});
+
 test("concurrent embedded login requests share one authentication operation", async () => {
   let resolveLogin;
   let waits = 0;
@@ -408,6 +750,45 @@ test("concurrent embedded login requests share one authentication operation", as
   resolveLogin({ authenticated: true });
   assert.deepEqual(await first, { authenticated: true });
   assert.equal(inspections, 1);
+});
+
+test("an explicit primary workspace login revalidates a stale authenticated launcher state", async () => {
+  let probes = 0;
+  let waits = 0;
+  const fixture = {
+    partition: "persist:codex-web-gpt-chatgpt",
+    state: { authenticated: true },
+    authNavigationError: null,
+    loginOperation: null,
+    show() {},
+    snapshot() { return { authenticated: true }; },
+    logger: { info() {} },
+    view: {
+      webContents: {
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        loadURL: async () => {},
+      },
+    },
+    probeAuthentication: async () => { probes += 1; },
+    waitForAuthenticated: async () => {
+      waits += 1;
+      return { authenticated: true };
+    },
+    runSessionInspection: async () => {},
+    readChatGptIdentity: async () => ({ email: "person@example.com" }),
+    activateHomeSurface() {},
+    withManualOperation: async (_name, action) => await action(),
+  };
+
+  const result = await BrowserHost.prototype.openLogin.call(
+    fixture,
+    "persist:codex-web-gpt-chatgpt",
+    { slotId: "primary" },
+  );
+
+  assert.equal(probes, 1);
+  assert.equal(waits, 1);
+  assert.deepEqual(result.identity, { email: "person@example.com" });
 });
 
 test("launcher quit remains gated through an active embedded-browser operation", () => {
@@ -489,6 +870,34 @@ test("launcher shutdown persists ChatGPT DOM storage and cookies before browser 
   await BrowserHost.prototype.persistSession.call(fixture);
 
   assert.deepEqual(calls, ["storage", "cookies"]);
+});
+
+test("launcher shutdown also persists every secondary workspace partition", async () => {
+  const calls = [];
+  const session = (name) => ({
+    flushStorageData: () => calls.push(`${name}:storage`),
+    cookies: { flushStore: async () => calls.push(`${name}:cookies`) },
+  });
+  const fixture = {
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        session: session("primary"),
+      },
+    },
+    keepaliveViews: new Map([
+      ["persist:slot-a", { webContents: { isDestroyed: () => false, session: session("slot-a") } }],
+      ["persist:slot-b", { webContents: { isDestroyed: () => false, session: session("slot-b") } }],
+    ]),
+  };
+
+  await BrowserHost.prototype.persistSession.call(fixture);
+
+  assert.deepEqual(calls, [
+    "primary:storage", "primary:cookies",
+    "slot-a:storage", "slot-a:cookies",
+    "slot-b:storage", "slot-b:cookies",
+  ]);
 });
 
 test("OAuth completion is re-proved on the primary Temporary Chat surface before login succeeds", async () => {
@@ -801,6 +1210,89 @@ test("connector verification is effort-independent and works while the browser s
       }],
     ],
   );
+});
+
+test("extra-partition connector verification refreshes Temporary Chat at a full viewport", async () => {
+  const calls = [];
+  const contents = {
+    destroyed: false,
+    isDestroyed: () => contents.destroyed,
+    setBackgroundThrottling: (value) => calls.push(["throttle", value]),
+    loadURL: async (url) => {
+      calls.push(["load", url]);
+      contents.url = url;
+    },
+    getURL: () => contents.url || "https://chatgpt.com/",
+    focus: () => calls.push(["focus"]),
+    executeJavaScript: async () => calls.push(["surface"]),
+  };
+  const view = {
+    webContents: contents,
+    setBounds: (bounds) => calls.push(["bounds", bounds]),
+    setVisible: (visible) => calls.push(["visible", visible]),
+  };
+  const fixture = {
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    partition: "persist:codex-web-gpt-chatgpt",
+    logger: { info: (event, detail) => calls.push(["log", event, detail]) },
+    setState: (patch) => calls.push(["state", patch]),
+    ensureKeepalivePartition: (partition) => {
+      calls.push(["keepalive", partition]);
+      return view;
+    },
+    hideKeepaliveView: (hidden) => calls.push(["hide", hidden === view]),
+    verifyConnectorWithBrowserHelper: async (options) => {
+      calls.push(["helper", options.appName, Boolean(options.surfaceId)]);
+      return { ok: true, appName: options.appName };
+    },
+  };
+
+  const result = await BrowserHost.prototype.runConnectorVerification.call(
+    fixture,
+    "Codex Native2",
+    "persist:codex-web-gpt-chatgpt-slot_us",
+  );
+  assert.deepEqual(result, { ok: true, appName: "Codex Native2" });
+  assert.equal(calls.some(([type]) => type === "refresh"), false);
+  assert.deepEqual(calls.find(([type]) => type === "load")?.[1], "https://chatgpt.com/?temporary-chat=true");
+  assert.equal(calls.some(([type, value]) => type === "helper" && value === "Codex Native2"), true);
+  assert.equal(calls.some(([type, hidden]) => type === "hide" && hidden === true), true);
+});
+
+test("secondary connector verification does not authenticate the primary partition", async () => {
+  const statePatches = [];
+  const contents = {
+    isDestroyed: () => false,
+    setBackgroundThrottling() {},
+    loadURL: async () => {},
+    getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    focus() {},
+    executeJavaScript: async () => {},
+  };
+  const view = {
+    webContents: contents,
+    setBounds() {},
+    setVisible() {},
+  };
+  const fixture = {
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    partition: "persist:codex-web-gpt-chatgpt",
+    logger: { info() {} },
+    setState: (patch) => statePatches.push(patch),
+    ensureKeepalivePartition: () => view,
+    hideKeepaliveView() {},
+    verifyConnectorWithBrowserHelper: async () => ({ ok: true, appName: "Codex Native2" }),
+  };
+
+  await BrowserHost.prototype.runConnectorVerification.call(
+    fixture,
+    "Codex Native2",
+    "persist:codex-web-gpt-chatgpt-slot_team",
+  );
+
+  assert.equal(statePatches.some((patch) => patch.authenticated === true), false);
 });
 
 test("a live helper retains exclusive ownership of its running turn", () => {

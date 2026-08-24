@@ -70,7 +70,7 @@ test("browser control server authenticates and owns turn visibility", async () =
     });
     assert.equal(end.status, 200);
     assert.deepEqual(calls, [
-      ["start", "abcdef123456", true, process.pid],
+      ["start", "abcdef123456", true, process.pid, undefined],
       ["heartbeat", "abcdef123456", process.pid],
       ["end", "abcdef123456", process.pid, "completed", true, undefined],
     ]);

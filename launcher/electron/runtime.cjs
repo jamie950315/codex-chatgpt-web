@@ -78,6 +78,14 @@ function captureRegularFile(filePath) {
   };
 }
 
+function displayWorkspaceName(name) {
+  if (typeof name !== "string" || !name.trim()) return undefined;
+  const value = name.trim();
+  if (/側邊欄|侧边栏|sidebar/i.test(value)) return undefined;
+  if (/^(open|close|開啟|關閉|打开|关闭)\b/i.test(value)) return undefined;
+  return value;
+}
+
 function restoreRegularFile(snapshot, platform = process.platform) {
   if (!snapshot.exists) {
     fs.rmSync(snapshot.path, { force: true });
@@ -167,6 +175,7 @@ class RuntimeHost {
     this.active = null;
     this.activeChild = null;
     this.lifecycleOperation = null;
+    this.runQueue = Promise.resolve();
     this.cleanupEphemeralSecrets();
   }
 
@@ -395,6 +404,13 @@ class RuntimeHost {
   }
 
   async run(name, args, options = {}) {
+    const execute = () => this.executeRun(name, args, options);
+    const queued = this.runQueue.then(execute, execute);
+    this.runQueue = queued.then(() => undefined, () => undefined);
+    return queued;
+  }
+
+  async executeRun(name, args, options = {}) {
     if (this.active) throw new Error(`Another launcher operation is active: ${this.active}`);
     if (this.activeChild
       && this.activeChild.exitCode === null
@@ -953,6 +969,163 @@ class RuntimeHost {
       connectorMigrated: connectorMigrationRequired,
       stdout: result.stdout,
     };
+  }
+
+  listAccounts() {
+    let config = {};
+    try { config = this.supervisor.readConfig?.() || {}; } catch { config = {}; }
+    const rotation = config.accountRotation;
+    const rotationConfigured = Boolean(rotation && (Array.isArray(rotation.slots) || Array.isArray(rotation.accounts)));
+    const slots = rotationConfigured
+      ? (Array.isArray(rotation.slots) ? rotation.slots : [])
+      : [{
+        id: "primary",
+        label: "Primary",
+        credentialId: "primary",
+        storageStatePath: config.storageStatePath || "",
+      }];
+    const credentials = Array.isArray(rotation?.credentials) ? rotation.credentials : [];
+    const primaryPartition = this.launcherProfile === "development"
+      ? "persist:codex-web-gpt-dev-chatgpt"
+      : "persist:codex-web-gpt-chatgpt";
+    const accountRecords = rotationConfigured && Array.isArray(rotation.accounts)
+      ? rotation.accounts
+      : [...new Map(slots.map((slot) => {
+        const accountId = slot.accountId || (slot.credentialId === "primary" ? "account_primary" : `account_${slot.credentialId}`);
+        return [accountId, {
+          id: accountId,
+          name: slot.accountId === "account_primary" || slot.id === "primary" ? "Primary" : slot.label,
+          email: undefined,
+          credentialId: slot.credentialId,
+        }];
+      })).values()];
+    return {
+      primaryTunnelId: config.tunnel?.tunnelId || "",
+      accounts: accountRecords.map((account) => ({
+        id: account.id,
+        name: account.name,
+        email: account.email,
+        credentialId: account.credentialId,
+        workspaces: slots
+          .filter((slot) => (slot.accountId || (slot.credentialId === account.credentialId ? account.id : "")) === account.id
+            || (!slot.accountId && slot.credentialId === account.credentialId))
+          .map((slot) => ({
+            id: slot.id,
+            name: slot.label,
+            chatgptWorkspaceName: displayWorkspaceName(slot.chatgptWorkspaceName),
+            signedIn: slot.signedIn === true,
+            partition: slot.id === "primary" ? primaryPartition : `${primaryPartition}-${slot.id}`,
+            credentialId: slot.credentialId,
+          })),
+      })),
+    };
+  }
+
+  async addWorkspace(input = {}) {
+    const accountId = typeof input.accountId === "string" ? input.accountId.trim() : "";
+    if (!accountId) throw new Error("Account id is required");
+    const args = ["accounts", "add-workspace", "--account", accountId];
+    if (input.name) args.push("--label", String(input.name));
+    return this.run("accounts-add-workspace", args, { message: "Adding ChatGPT workspace", timeoutMs: 30_000 });
+  }
+
+  async renameAccount(input = {}) {
+    if (!input.id || !input.name) throw new Error("Account id and name are required");
+    return this.run("accounts-rename-account", ["accounts", "rename-account", String(input.id), "--label", String(input.name)], {
+      message: "Renaming account",
+      timeoutMs: 15_000,
+    });
+  }
+
+  async renameWorkspace(input = {}) {
+    if (!input.id || !input.name) throw new Error("Workspace id and name are required");
+    return this.run("accounts-rename-workspace", ["accounts", "rename-workspace", String(input.id), "--label", String(input.name)], {
+      message: "Renaming workspace",
+      timeoutMs: 15_000,
+    });
+  }
+
+  async updateAccountIdentity(input = {}) {
+    if (!input.slotId) throw new Error("Workspace id is required");
+    const args = ["accounts", "update-identity", String(input.slotId)];
+    if (input.email) args.push("--email", String(input.email));
+    if (input.workspaceName) args.push("--workspace-name", String(input.workspaceName));
+    if (input.signedIn) args.push("--signed-in");
+    if (args.length === 3) return { stdout: "" };
+    return this.run("accounts-update-identity", args, { message: "Saving ChatGPT identity", timeoutMs: 15_000 });
+  }
+
+  async addAccount(input = {}) {
+    const label = typeof input.label === "string" ? input.label.trim() : "";
+    if (!label) throw new Error("Account label is required");
+    const args = ["accounts", "add", "--label", label];
+    if (input.reuseCredentialId) {
+      args.push("--reuse-credentials", String(input.reuseCredentialId));
+      return this.run("accounts-add", args, { message: "Adding ChatGPT workspace", timeoutMs: 30_000 });
+    }
+    if (input.sameTunnel === true) {
+      const config = this.listAccounts();
+      if (!config.primaryTunnelId) throw new Error("Primary tunnel is not configured");
+      input.tunnelId = config.primaryTunnelId;
+    }
+    if (!/^tunnel_[a-f0-9]{32}$/.test(input.tunnelId || "")) {
+      throw new Error("New accounts need a tunnel id, or reuse existing credentials for another workspace");
+    }
+    if (typeof input.runtimeKey !== "string" || input.runtimeKey.trim().length < 20) {
+      throw new Error("New accounts need a Tunnels Read + Use API key, or reuse existing credentials");
+    }
+    const secretsDir = path.join(this.app.getPath("userData"), "secrets");
+    fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    const keyPath = path.join(secretsDir, `runtime-key-${randomBytes(16).toString("hex")}.tmp`);
+    fs.writeFileSync(keyPath, input.runtimeKey.trim(), { flag: "wx", mode: 0o600 });
+    args.push("--tunnel-id", input.tunnelId, "--runtime-key-file", keyPath);
+    return this.run("accounts-add", args, { message: "Adding ChatGPT account", timeoutMs: 30_000 })
+      .finally(() => fs.rmSync(keyPath, { force: true }));
+  }
+
+  async setAccountCredentials(input = {}) {
+    const slotIds = Array.isArray(input.slotIds) ? input.slotIds.filter(Boolean) : [];
+    if (slotIds.length === 0) throw new Error("Select at least one account slot");
+    if (typeof input.runtimeKey !== "string" || input.runtimeKey.trim().length < 20) {
+      throw new Error("A Tunnels Read + Use API key is required");
+    }
+    const accounts = this.listAccounts();
+    const tunnelId = input.sameTunnel === true
+      ? accounts.primaryTunnelId
+      : (input.tunnelId || accounts.primaryTunnelId);
+    if (!/^tunnel_[a-f0-9]{32}$/.test(tunnelId || "")) {
+      throw new Error("A tunnel id is required");
+    }
+    const secretsDir = path.join(this.app.getPath("userData"), "secrets");
+    fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+    const keyPath = path.join(secretsDir, `runtime-key-${randomBytes(16).toString("hex")}.tmp`);
+    fs.writeFileSync(keyPath, input.runtimeKey.trim(), { flag: "wx", mode: 0o600 });
+    return this.run(
+      "accounts-set-credentials",
+      ["accounts", "set-credentials", ...slotIds, "--tunnel-id", tunnelId, "--runtime-key-file", keyPath],
+      { message: "Updating account credentials", timeoutMs: 30_000 },
+    ).finally(() => fs.rmSync(keyPath, { force: true }));
+  }
+
+  async removeAccount(slotId) {
+    if (!slotId) throw new Error("Workspace id is required");
+    return this.run("accounts-remove", ["accounts", "remove", slotId], { message: "Removing ChatGPT workspace", timeoutMs: 15_000 });
+  }
+
+  async validateAccounts() {
+    return this.run("accounts-validate", ["accounts", "validate"], {
+      message: "Validating ChatGPT accounts",
+      timeoutMs: 30_000,
+    });
+  }
+
+  async removeAccountRecord(input = {}) {
+    const id = typeof input.id === "string" ? input.id.trim() : "";
+    if (!id) throw new Error("Account id is required");
+    return this.run("accounts-remove-account", ["accounts", "remove-account", id], {
+      message: "Removing ChatGPT account",
+      timeoutMs: 15_000,
+    });
   }
 
   setupMcp({ tunnelId = "", runtimeKey = "", replace = false } = {}) {

@@ -269,7 +269,18 @@ export interface CodexProviderConfig {
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
+    /** Validated account/workspace rotation snapshot owned by the active server configuration. */
+    accountRotation?: AccountRotationConfig;
+    /** Exact live config path used to refresh account rotation between native Codex turns. */
+    accountRotationConfigPath?: string;
+    /** Active rotation slot for this browser turn. */
+    rotationSlotId?: string;
+    /** Electron session partition that owns this slot's ChatGPT cookies. */
+    launcherPartition?: string;
+    /** Owned launcher surface id used to attach Playwright to a specific ChatGPT view. */
+    surfaceId?: string;
     /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
     experimentalBiggerContext?: boolean;
   };
 }
+import type { AccountRotationConfig } from "./account-rotation";

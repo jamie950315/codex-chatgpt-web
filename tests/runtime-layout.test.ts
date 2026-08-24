@@ -164,10 +164,30 @@ test("launcher browser ownership is explicit in provider configuration", () => {
   const config = defaultConfig("browser-only");
   config.browserHost = "launcher";
   config.browserHostDescriptorPath = "/Users/example/.codex-chatgpt-web/runtime/launcher-browser.json";
+  config.accountRotation = {
+    accounts: [{ id: "account_test", name: "Test", credentialId: "credential_test" }],
+    credentials: [{
+      id: "credential_test",
+      tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      runtimeKeyFile: "/Users/example/.codex-chatgpt-web/secrets/test.key",
+      alias: "codex-chatgpt-web",
+      profileName: "codex-chatgpt-web",
+    }],
+    slots: [{
+      id: "slot_test",
+      accountId: "account_test",
+      label: "Test workspace",
+      storageStatePath: "/Users/example/.codex-chatgpt-web/browser/slots/slot_test/storage-state.json",
+      credentialId: "credential_test",
+    }],
+  };
   expect(providerConfig(config).chatgptWeb).toMatchObject({
     browserHost: "launcher",
     browserHostDescriptorPath: config.browserHostDescriptorPath,
     solAvailable: true,
+    accountRotation: {
+      slots: [{ id: "slot_test" }],
+    },
   });
 });
 

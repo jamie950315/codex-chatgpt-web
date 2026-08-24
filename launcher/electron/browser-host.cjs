@@ -18,6 +18,8 @@ const {
   shellZoomActionForInput,
 } = require("./browser-state.cjs");
 
+const CHATGPT_IDENTITY_SCRIPT = require("./chatgpt-identity-script.cjs");
+
 const TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 const IDLE_BROWSER_URL = "about:blank#codex-web-gpt-browser-host";
@@ -74,6 +76,10 @@ const CHATGPT_VIEWPORT_CSS = `
 `;
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+function withIdentity(snapshot, identity) {
+  if (identity?.email || identity?.workspaceName) return { ...snapshot, identity };
+  return snapshot;
+}
 
 function visibleElementScript(selector) {
   return `Array.from(document.querySelectorAll(${JSON.stringify(selector)})).find((element) => {
@@ -86,6 +92,160 @@ function visibleElementScript(selector) {
       && style.visibility !== "hidden"
       && style.opacity !== "0";
   })`;
+}
+
+function probeChatGptAuthentication(contents) {
+  return contents.executeJavaScript(`(async () => {
+    const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
+    const readSurface = () => {
+      const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
+      const actualUrl = new URL(location.href);
+      return {
+        url: actualUrl.href,
+        composer: Boolean(composer),
+        temporary: actualUrl.origin === expectedUrl.origin
+          && actualUrl.pathname === expectedUrl.pathname
+          && actualUrl.searchParams.get("temporary-chat") === "true",
+        readyState: document.readyState,
+      };
+    };
+    const initialSurface = readSurface();
+    let sessionAuthenticated = false;
+    if (new URL(initialSurface.url).origin === expectedUrl.origin) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ${CHATGPT_AUTH_SESSION_TIMEOUT_MS});
+      try {
+        const response = await fetch("/api/auth/session", {
+          credentials: "include",
+          cache: "no-store",
+          headers: { accept: "application/json" },
+          signal: controller.signal,
+        });
+        const responseUrl = new URL(response.url);
+        const payload = response.ok
+          && responseUrl.origin === expectedUrl.origin
+          && responseUrl.pathname === "/api/auth/session"
+          && response.headers.get("content-type")?.includes("application/json")
+          ? await response.json()
+          : null;
+        const user = payload?.user && typeof payload.user === "object" && !Array.isArray(payload.user)
+          ? payload.user
+          : null;
+        const sessionHasUser = user !== null && Object.keys(user).length > 0;
+        const sessionHasNoError = payload?.error === undefined || payload.error === null || payload.error === "";
+        const sessionExpiryIsValid = payload?.expires === undefined || payload.expires === null
+          ? true
+          : typeof payload.expires === "string"
+            && Number.isFinite(Date.parse(payload.expires))
+            && Date.parse(payload.expires) > Date.now();
+        sessionAuthenticated = sessionHasUser
+          && sessionHasNoError
+          && sessionExpiryIsValid;
+      } catch {}
+      finally { clearTimeout(timeout); }
+    }
+    return { ...readSurface(), sessionAuthenticated };
+  })()`, true).then((result) => ({
+    ...result,
+    authenticated: Boolean(result.composer && result.temporary && result.sessionAuthenticated),
+  })).catch(() => ({
+    url: "",
+    composer: false,
+    temporary: false,
+    sessionAuthenticated: false,
+    readyState: "unknown",
+    authenticated: false,
+  }));
+}
+
+const VALIDATION_STATUSES = new Set(["ok", "error", "warning", "skipped"]);
+
+function validValidationCheck(value) {
+  return Boolean(
+    value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && VALIDATION_STATUSES.has(value.status)
+    && typeof value.message === "string"
+    && value.message.trim(),
+  );
+}
+
+function reconcileAccountValidationReport(listed, report) {
+  const fail = (reason) => {
+    throw new Error(`Account validation report ${reason}`);
+  };
+  if (!report || typeof report !== "object" || Array.isArray(report)
+    || typeof report.ok !== "boolean" || !Array.isArray(report.accounts)
+    || report.accounts.length === 0) {
+    fail("is malformed or empty");
+  }
+  const listedAccounts = Array.isArray(listed?.accounts) ? listed.accounts : [];
+  const reportAccountIds = new Set();
+  for (const account of report.accounts) {
+    if (!account || typeof account !== "object" || Array.isArray(account)
+      || typeof account.id !== "string" || !account.id
+      || typeof account.name !== "string" || !account.name
+      || !validValidationCheck(account.tunnel)
+      || !Array.isArray(account.workspaces)) {
+      fail("contains a malformed account");
+    }
+    if (reportAccountIds.has(account.id)) fail(`contains duplicate account ${JSON.stringify(account.id)}`);
+    reportAccountIds.add(account.id);
+    const listedAccount = listedAccounts.find((candidate) => candidate.id === account.id);
+    if (!listedAccount) fail(`contains unknown account ${JSON.stringify(account.id)}`);
+    const workspaceIds = new Set();
+    for (const workspace of account.workspaces) {
+      if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)
+        || typeof workspace.id !== "string" || !workspace.id
+        || typeof workspace.name !== "string" || !workspace.name
+        || !validValidationCheck(workspace.login)) {
+        fail(`contains a malformed workspace for account ${JSON.stringify(account.id)}`);
+      }
+      if (workspaceIds.has(workspace.id)) {
+        fail(`contains duplicate workspace ${JSON.stringify(workspace.id)}`);
+      }
+      workspaceIds.add(workspace.id);
+    }
+    const listedWorkspaceIds = new Set(
+      (Array.isArray(listedAccount.workspaces) ? listedAccount.workspaces : []).map((workspace) => workspace.id),
+    );
+    if (workspaceIds.size !== listedWorkspaceIds.size
+      || [...listedWorkspaceIds].some((id) => !workspaceIds.has(id))) {
+      fail(`does not cover every workspace for account ${JSON.stringify(account.id)}`);
+    }
+  }
+  const listedAccountIds = new Set(listedAccounts.map((account) => account.id));
+  if (reportAccountIds.size !== listedAccountIds.size
+    || [...listedAccountIds].some((id) => !reportAccountIds.has(id))) {
+    fail("does not cover every configured account");
+  }
+  return report;
+}
+
+function accountIdentityUpdate(slotId, identity = {}) {
+  if (!identity.email && !identity.workspaceName) return null;
+  return {
+    slotId,
+    email: identity.email,
+    workspaceName: identity.workspaceName,
+    signedIn: true,
+  };
+}
+
+function createSerialTaskQueue() {
+  let tail = Promise.resolve();
+  return {
+    enqueue(task) {
+      if (typeof task !== "function") throw new Error("Serial task queue requires a task");
+      const result = tail.then(task, task);
+      tail = result.then(() => undefined, () => undefined);
+      return result;
+    },
+    wait() {
+      return tail;
+    },
+  };
 }
 
 function normalizeBounds(bounds) {
@@ -201,12 +361,16 @@ class BrowserHost {
     this.surfaceId = randomBytes(24).toString("base64url");
     this.visible = false;
     this.surfaceActive = true;
+    this.keepaliveViews = new Map();
+    this.keepaliveTimer = null;
     this.turnTabs = new Map();
     this.closedTurnOwners = new Map();
     this.userCancelledTurnOwners = new Map();
     this.selectedTabId = "home";
     this.manualOperation = null;
     this.loginOperation = null;
+    this.loginPartition = null;
+    this.extraLoginOperations = new Map();
     this.cloudflareChallengeRecovery = null;
     this.cloudflareChallengeRecoveryArmed = true;
     this.cloudflareChallengeRecoveryDelayMs = CLOUDFLARE_CHALLENGE_RECOVERY_DELAY_MS;
@@ -269,7 +433,10 @@ class BrowserHost {
   }
 
   currentOperation() {
-    return this.manualOperation || (this.loginOperation ? "ChatGPT login" : null);
+    if (this.manualOperation) return this.manualOperation;
+    if (this.loginOperation) return "ChatGPT login";
+    if (this.extraLoginOperations?.size > 0) return "ChatGPT login";
+    return null;
   }
 
   get activeTraceId() {
@@ -288,11 +455,112 @@ class BrowserHost {
     };
   }
 
+  ensureKeepalivePartition(partition) {
+    if (!partition) return this.view;
+    let view = this.keepaliveViews.get(partition);
+    if (view && !view.webContents.isDestroyed()) return view;
+    view = new WebContentsView({
+      webPreferences: {
+        partition,
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        spellcheck: true,
+        backgroundThrottling: false,
+      },
+    });
+    this.window.contentView.addChildView(view);
+    view.setBounds({ x: 0, y: 0, width: 1, height: 1 });
+    view.setVisible(false);
+    view.webContents.loadURL(TEMPORARY_CHAT_URL).catch(() => {});
+    this.keepaliveViews.set(partition, view);
+    return view;
+  }
+
+  async syncAccountKeepalives(partitions = []) {
+    const wanted = new Set(
+      (Array.isArray(partitions) ? partitions : []).filter((value) => (
+        typeof value === "string" && value.startsWith("persist:codex-web-gpt-") && value !== this.partition
+      )),
+    );
+    for (const partition of wanted) this.ensureKeepalivePartition(partition);
+    const retired = [];
+    for (const [partition, view] of this.keepaliveViews) {
+      if (wanted.has(partition)) continue;
+      this.keepaliveViews.delete(partition);
+      if (this.loginPartition === partition) this.loginPartition = null;
+      retired.push((async () => {
+        try {
+          await view.webContents.session.clearStorageData();
+        } catch (error) {
+          this.logger?.warn?.("browser.account_partition_cleanup_failed", {
+            partition,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+        try { this.window.contentView.removeChildView(view); } catch {}
+        if (!view.webContents.isDestroyed()) view.webContents.close();
+      })());
+    }
+    if (this.keepaliveViews.size === 0 && this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+    if (!this.keepaliveTimer && this.keepaliveViews.size > 0) {
+      this.keepaliveTimer = setInterval(() => {
+        for (const view of this.keepaliveViews.values()) {
+          if (view.webContents.isDestroyed()) continue;
+          view.webContents.loadURL(TEMPORARY_CHAT_URL).catch(() => {});
+        }
+      }, 8 * 60 * 1000);
+      this.keepaliveTimer.unref?.();
+    }
+    await Promise.all(retired);
+  }
+
+  async readChatGptIdentity(contents) {
+    if (!contents || contents.isDestroyed() || typeof contents.executeJavaScript !== "function") return {};
+    try {
+      const identity = await contents.executeJavaScript(CHATGPT_IDENTITY_SCRIPT, true);
+      const workspaceName = typeof identity?.workspaceName === "string" ? identity.workspaceName.trim() : "";
+      const chromeName = /側邊欄|侧边栏|sidebar/i.test(workspaceName)
+        || /^(open|close|開啟|關閉|打开|关闭)\b/i.test(workspaceName);
+      return {
+        ...(identity?.email ? { email: identity.email } : {}),
+        ...(workspaceName && !chromeName ? { workspaceName } : {}),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  async readChatGptIdentityForPartition(partition) {
+    const extra = Boolean(partition && partition !== this.partition);
+    const view = extra ? this.ensureKeepalivePartition(partition) : this.view;
+    if (!view || view.webContents.isDestroyed()) return {};
+    const url = view.webContents.getURL();
+    if (!String(url).startsWith(CHATGPT_ORIGIN)) {
+      await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      await sleep(2000);
+    }
+    const restore = extra && this.loginPartition !== partition;
+    if (extra) {
+      view.setBounds({ x: -1600, y: 0, width: 960, height: 720 });
+      view.setVisible(true);
+      await sleep(1500);
+    }
+    try {
+      return await this.readChatGptIdentity(view.webContents);
+    } finally {
+      if (restore) this.hideKeepaliveView(view);
+    }
+  }
+
   selectedTurnTab() {
     return this.turnTabs.get(this.selectedTabId) || null;
   }
 
-  createTurnTab(traceId, helperPid) {
+  createTurnTab(traceId, helperPid, partition = this.partition) {
     if (this.turnTabs.size >= MAX_BROWSER_TABS) {
       throw new Error(
         `ChatGPT Web already has ${MAX_BROWSER_TABS} browser tabs; close one before starting another turn to avoid excessive parallel traffic on the ChatGPT account`,
@@ -305,7 +573,7 @@ class BrowserHost {
     if (!ordinal) throw new Error("ChatGPT Web browser tab allocation is inconsistent");
     const view = new WebContentsView({
       webPreferences: {
-        partition: this.partition,
+        partition: partition || this.partition,
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
@@ -800,7 +1068,17 @@ class BrowserHost {
   }
 
   activeView() {
+    if (this.loginPartition) {
+      const loginView = this.keepaliveViews.get(this.loginPartition);
+      if (loginView && !loginView.webContents.isDestroyed()) return loginView;
+    }
     return this.authView || this.selectedTurnTab()?.view || this.view;
+  }
+
+  hideKeepaliveView(view) {
+    if (!view || view.webContents?.isDestroyed?.()) return;
+    view.setVisible(false);
+    view.setBounds({ x: 0, y: 0, width: 1, height: 1 });
   }
 
   hiddenTurnBounds() {
@@ -824,13 +1102,25 @@ class BrowserHost {
   syncViewVisibility() {
     const visible = browserViewVisible(this.visible, this.surfaceActive, this.boundsReady);
     const selected = this.selectedTurnTab();
-    this.view.setVisible(visible && !this.authView && !selected);
+    const loginView = this.loginPartition ? this.keepaliveViews.get(this.loginPartition) : null;
+    const showLogin = Boolean(
+      visible && !this.authView && !selected && loginView && !loginView.webContents.isDestroyed(),
+    );
+    this.view.setVisible(visible && !this.authView && !selected && !showLogin);
     for (const tab of this.turnTabs.values()) {
       const tabVisible = visible && !this.authView && selected?.id === tab.id;
       tab.view.setBounds(tabVisible ? this.bounds : this.hiddenTurnBounds());
       tab.view.setVisible(tabVisible);
     }
     this.authView?.setVisible(visible);
+    for (const [partition, view] of this.keepaliveViews || []) {
+      if (showLogin && partition === this.loginPartition) {
+        view.setBounds(this.bounds);
+        view.setVisible(true);
+      } else {
+        this.hideKeepaliveView(view);
+      }
+    }
   }
 
   selectTab(tabId) {
@@ -1118,7 +1408,7 @@ class BrowserHost {
     return this.snapshot();
   }
 
-  beginTurn(traceId, reveal, helperPid) {
+  beginTurn(traceId, reveal, helperPid, partition) {
     if (this.manualOperation) {
       throw new Error(`ChatGPT browser is busy with ${this.manualOperation}`);
     }
@@ -1157,7 +1447,7 @@ class BrowserHost {
       this.logger.info("browser.tab_reused", { tabId: existing.id, traceId });
       return { surfaceId: existing.surfaceId, tabId: existing.id };
     }
-    const tab = this.createTurnTab(traceId, helperPid);
+    const tab = this.createTurnTab(traceId, helperPid, partition);
     this.selectedTabId = tab.id;
     if (reveal) this.show();
     else this.syncViewVisibility();
@@ -1212,35 +1502,105 @@ class BrowserHost {
     });
   }
 
-  openLogin() {
-    if (this.state.authenticated) {
+  openLogin(partition, options = {}) {
+    const extraPartition = partition && partition !== this.partition;
+    if (!extraPartition && this.state.authenticated && !options.slotId) {
       this.activateHomeSurface();
       this.show();
       return Promise.resolve(this.snapshot());
     }
-    if (this.loginOperation) {
+    if (!extraPartition && this.loginOperation) {
       this.activateHomeSurface();
       this.show();
       return this.loginOperation;
     }
+    if (extraPartition) {
+      if (!this.extraLoginOperations) this.extraLoginOperations = new Map();
+      const existing = this.extraLoginOperations.get(partition);
+      if (existing) {
+        this.loginPartition = partition;
+        this.show();
+        this.syncViewVisibility();
+        return existing;
+      }
+      const operation = Promise.resolve(this.ready?.() ?? undefined)
+        .then(() => this.runExtraPartitionLogin(partition, options))
+        .finally(() => {
+          this.extraLoginOperations.delete(partition);
+          if (this.loginPartition === partition) this.loginPartition = null;
+          this.syncViewVisibility?.();
+        });
+      this.extraLoginOperations.set(partition, operation);
+      return operation;
+    }
     const operation = this.withManualOperation("ChatGPT login", async () => {
       this.authNavigationError = null;
       this.show();
-      this.logger.info("browser.login_opened");
+      this.logger.info("browser.login_opened", {});
       const current = this.view.webContents.getURL();
       if (!current.startsWith(CHATGPT_ORIGIN)) {
         await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
       }
       await this.probeAuthentication();
-      const authenticated = await this.waitForAuthenticated();
+      const snapshot = await this.waitForAuthenticated();
       await this.runSessionInspection(false);
-      return authenticated;
+      const identity = typeof this.readChatGptIdentity === "function"
+        ? await this.readChatGptIdentity(this.view.webContents)
+        : {};
+      return withIdentity(snapshot, identity);
     });
     const tracked = operation.finally(() => {
       if (this.loginOperation === tracked) this.loginOperation = null;
     });
     this.loginOperation = tracked;
     return tracked;
+  }
+
+  async runExtraPartitionLogin(partition, options = {}) {
+    const rejectWorkspaceNames = new Set(
+      (Array.isArray(options.rejectWorkspaceNames) ? options.rejectWorkspaceNames : [])
+        .filter((value) => typeof value === "string" && value.trim())
+        .map((value) => value.trim().toLowerCase()),
+    );
+    this.loginPartition = partition;
+    this.show();
+    this.logger.info("browser.login_opened", { partition });
+    const view = this.ensureKeepalivePartition(partition);
+    this.syncViewVisibility();
+    await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+    const deadline = Date.now() + 180_000;
+    let signedInAt = 0;
+    let lastIdentity = {};
+    while (Date.now() < deadline) {
+      const authentication = await probeChatGptAuthentication(view.webContents);
+      if (authentication.authenticated) {
+        if (!signedInAt) {
+          signedInAt = Date.now();
+          this.logger.info("browser.account_slot_signed_in", { partition });
+          if (typeof options.onSignedIn === "function") await options.onSignedIn({});
+        }
+        const identity = typeof this.readChatGptIdentity === "function"
+          ? await this.readChatGptIdentity(view.webContents)
+          : {};
+        const workspace = identity.workspaceName || "";
+        const rejected = workspace && rejectWorkspaceNames.has(workspace.toLowerCase());
+        lastIdentity = rejected
+          ? { ...(identity.email ? { email: identity.email } : {}) }
+          : identity;
+        const waited = Date.now() - signedInAt;
+        const complete = lastIdentity.email && lastIdentity.workspaceName;
+        if (complete || (lastIdentity.workspaceName && waited >= 3_000) || waited >= 12_000) {
+          if (typeof options.onSignedIn === "function") await options.onSignedIn(lastIdentity);
+          return withIdentity(this.snapshot(), lastIdentity);
+        }
+      }
+      await sleep(750);
+    }
+    if (signedInAt) {
+      if (typeof options.onSignedIn === "function") await options.onSignedIn(lastIdentity);
+      return withIdentity(this.snapshot(), lastIdentity);
+    }
+    throw new Error("ChatGPT login was not completed before the timeout");
   }
 
   async logout() {
@@ -1295,74 +1655,17 @@ class BrowserHost {
       this.setState({ status: "signed-out", message: "Sign in to ChatGPT", authenticated: false, url });
       return this.snapshot();
     }
-    const probe = (contents) => contents.executeJavaScript(`(async () => {
-      const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
-      const readSurface = () => {
-        const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
-        const actualUrl = new URL(location.href);
-        return {
-          url: actualUrl.href,
-          composer: Boolean(composer),
-          temporary: actualUrl.origin === expectedUrl.origin
-            && actualUrl.pathname === expectedUrl.pathname
-            && actualUrl.searchParams.get("temporary-chat") === "true",
-          readyState: document.readyState,
-        };
-      };
-      const initialSurface = readSurface();
-      let sessionAuthenticated = false;
-      if (new URL(initialSurface.url).origin === expectedUrl.origin) {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), ${CHATGPT_AUTH_SESSION_TIMEOUT_MS});
-        try {
-          const response = await fetch("/api/auth/session", {
-            credentials: "include",
-            cache: "no-store",
-            headers: { accept: "application/json" },
-            signal: controller.signal,
-          });
-          const responseUrl = new URL(response.url);
-          const payload = response.ok
-            && responseUrl.origin === expectedUrl.origin
-            && responseUrl.pathname === "/api/auth/session"
-            && response.headers.get("content-type")?.includes("application/json")
-            ? await response.json()
-            : null;
-          const user = payload?.user && typeof payload.user === "object" && !Array.isArray(payload.user)
-            ? payload.user
-            : null;
-          const sessionHasUser = user !== null && Object.keys(user).length > 0;
-          const sessionHasNoError = payload?.error === undefined || payload.error === null || payload.error === "";
-          const sessionExpiryIsValid = payload?.expires === undefined || payload.expires === null
-            ? true
-            : typeof payload.expires === "string"
-              && Number.isFinite(Date.parse(payload.expires))
-              && Date.parse(payload.expires) > Date.now();
-          sessionAuthenticated = sessionHasUser
-            && sessionHasNoError
-            && sessionExpiryIsValid;
-        } catch {}
-        finally { clearTimeout(timeout); }
-      }
-      return { ...readSurface(), sessionAuthenticated };
-    })()`, true).catch(() => ({
-      url: "",
-      composer: false,
-      temporary: false,
-      sessionAuthenticated: false,
-      readyState: "unknown",
-    }));
-    let result = await probe(this.view.webContents);
-    if (!(result.composer && result.temporary && result.sessionAuthenticated)
+    let result = await probeChatGptAuthentication(this.view.webContents);
+    if (!result.authenticated
       && this.authView
       && !this.authView.webContents.isDestroyed()) {
-      const authResult = await probe(this.authView.webContents);
+      const authResult = await probeChatGptAuthentication(this.authView.webContents);
       if (authResult.sessionAuthenticated) {
         const completedAuthView = this.authView;
         this.closeAuthView(completedAuthView, true, false);
         await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
         url = this.view.webContents.getURL();
-        result = await probe(this.view.webContents);
+        result = await probeChatGptAuthentication(this.view.webContents);
       }
     }
     if (this.manualOperation === "ChatGPT login"
@@ -1371,7 +1674,7 @@ class BrowserHost {
       && !this.view.webContents.isDestroyed()) {
       await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
       url = this.view.webContents.getURL();
-      result = await probe(this.view.webContents);
+      result = await probeChatGptAuthentication(this.view.webContents);
     }
     if (result.composer && result.temporary && result.sessionAuthenticated) {
       if (this.authView && !this.authView.webContents.isDestroyed()) {
@@ -1452,19 +1755,80 @@ class BrowserHost {
     return await this.withManualOperation("connector verification", () => this.runConnectorVerification(appName));
   }
 
-  async runConnectorVerification(appName) {
+  async runConnectorVerification(appName, partition) {
     const connectorName = validateConnectorName(appName);
     this.setState({ status: "testing", message: "Checking ChatGPT connector" });
-    await this.refreshChatGptHomeDocument();
-    const result = await this.verifyConnectorWithBrowserHelper({
-      helper: this.helper,
-      descriptorPath: this.descriptorPath,
-      appName: connectorName,
-      logger: this.logger,
-    });
-    this.logger.info("connector.verified", { appName: connectorName });
-    this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
-    return result;
+    const extra = partition && partition !== this.partition;
+    if (!extra) {
+      await this.refreshChatGptHomeDocument();
+      const result = await this.verifyConnectorWithBrowserHelper({
+        helper: this.helper,
+        descriptorPath: this.descriptorPath,
+        appName: connectorName,
+        logger: this.logger,
+      });
+      this.logger.info("connector.verified", { appName: connectorName });
+      this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
+      return result;
+    }
+    const view = this.ensureKeepalivePartition(partition);
+    view.setBounds({ x: -1600, y: 0, width: 960, height: 720 });
+    view.setVisible(true);
+    if (view.webContents && !view.webContents.isDestroyed()) {
+      view.webContents.setBackgroundThrottling(false);
+    }
+    try {
+      await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline) {
+        const current = view.webContents.getURL();
+        if (current.startsWith(CHATGPT_ORIGIN) && !current.includes("/auth")) break;
+        await sleep(500);
+      }
+      const signedInUrl = view.webContents.getURL();
+      if (!signedInUrl.startsWith(CHATGPT_ORIGIN) || signedInUrl.includes("/auth")) {
+        throw new Error("Not signed in to ChatGPT on this workspace");
+      }
+      await sleep(400);
+      if (!view.webContents.isDestroyed()) view.webContents.focus();
+      const surfaceId = randomBytes(24).toString("base64url");
+      const encoded = JSON.stringify(surfaceId);
+      await view.webContents.executeJavaScript(`(() => {
+        Object.defineProperty(globalThis, "__CODEX_WEB_GPT_SURFACE_ID__", {
+          value: ${encoded}, configurable: true, enumerable: false, writable: true,
+        });
+        document.documentElement.dataset.codexWebGptSurface = ${encoded};
+      })()`, true);
+      const result = await this.verifyConnectorWithBrowserHelper({
+        helper: this.helper,
+        descriptorPath: this.descriptorPath,
+        appName: connectorName,
+        logger: this.logger,
+        surfaceId,
+      });
+      this.logger.info("connector.verified", { appName: connectorName, partition });
+      this.setState({ status: "ready", message: "ChatGPT connector is available" });
+      return result;
+    } finally {
+      if (this.loginPartition !== partition) this.hideKeepaliveView(view);
+    }
+  }
+
+  async probePartitionLogin(partition) {
+    const extra = partition && partition !== this.partition;
+    const view = extra ? this.ensureKeepalivePartition(partition) : this.view;
+    if (!view || view.webContents.isDestroyed()) {
+      return { status: "error", message: "ChatGPT browser surface is unavailable" };
+    }
+    if (!String(view.webContents.getURL()).startsWith(CHATGPT_ORIGIN)) {
+      await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      await sleep(1500);
+    }
+    const authentication = await probeChatGptAuthentication(view.webContents);
+    if (authentication.authenticated) {
+      return { status: "ok", message: "ChatGPT session is signed in" };
+    }
+    return { status: "error", message: "Not signed in to ChatGPT on this workspace" };
   }
 
   async inspectSession(detectCapabilities = false) {
@@ -1541,11 +1905,22 @@ class BrowserHost {
   }
 
   async persistSession() {
-    const contents = this.view?.webContents;
-    if (!contents || contents.isDestroyed()) return;
-    const browserSession = contents.session;
-    browserSession.flushStorageData();
-    await browserSession.cookies.flushStore();
+    const sessions = [];
+    const seen = new Set();
+    const collect = (view) => {
+      const contents = view?.webContents;
+      if (!contents || contents.isDestroyed()) return;
+      const browserSession = contents.session;
+      if (!browserSession || seen.has(browserSession)) return;
+      seen.add(browserSession);
+      sessions.push(browserSession);
+    };
+    collect(this.view);
+    for (const view of this.keepaliveViews?.values?.() || []) collect(view);
+    for (const browserSession of sessions) {
+      browserSession.flushStorageData();
+      await browserSession.cookies.flushStore();
+    }
   }
 
   destroy() {
@@ -1559,6 +1934,12 @@ class BrowserHost {
     this.shellZoomShortcutBindings.clear();
     this.closeAuthView(this.authView, true);
     this.clearHomeNavigationTimeout();
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    for (const view of this.keepaliveViews.values()) {
+      try { this.window.contentView.removeChildView(view); } catch {}
+      if (!view.webContents.isDestroyed()) view.webContents.close();
+    }
+    this.keepaliveViews.clear();
     if (this.turnLeaseSweep) clearInterval(this.turnLeaseSweep);
     for (const tab of this.turnTabs.values()) {
       try { this.window.contentView.removeChildView(tab.view); } catch {}
@@ -1570,12 +1951,15 @@ class BrowserHost {
 }
 
 module.exports = {
+  accountIdentityUpdate,
   allowedAuthUrl,
   BrowserHost,
   BrowserTurnCancelledError,
   CHATGPT_VIEWPORT_CSS,
+  createSerialTaskQueue,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
   isTemporaryChatUrl,
+  reconcileAccountValidationReport,
   TEMPORARY_CHAT_URL,
 };

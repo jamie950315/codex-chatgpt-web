@@ -4,10 +4,16 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { defaultBrokerEndpoint } from "../src/config";
+import { loadRotationState, saveRotationState } from "../src/account-rotation";
 
-async function runCli(args: string[], env: Record<string, string | undefined>) {
+async function runCli(
+  args: string[],
+  env: Record<string, string | undefined>,
+  options: { preload?: string } = {},
+) {
   const child = Bun.spawn([
     process.execPath,
+    ...(options.preload ? ["--preload", options.preload] : []),
     resolve(import.meta.dir, "../src/cli.ts"),
     ...args,
   ], {
@@ -21,6 +27,29 @@ async function runCli(args: string[], env: Record<string, string | undefined>) {
     new Response(child.stderr).text(),
   ]);
   return { exitCode, stdout, stderr };
+}
+
+function browserOnlyConfig(appHome: string, accountRotation?: Record<string, unknown>) {
+  return {
+    version: 3,
+    releaseVersion: "0.2.0",
+    mode: "browser-only",
+    host: "127.0.0.1",
+    port: 17841,
+    contextWindow: 256_000,
+    appName: "Codex Native2",
+    browserHost: "managed-chrome",
+    chromeExecutablePath: process.execPath,
+    storageStatePath: join(appHome, "browser", "storage-state.json"),
+    brokerSocketPath: defaultBrokerEndpoint(appHome),
+    headed: true,
+    solAvailable: true,
+    proAvailable: false,
+    autoApproveToolCalls: false,
+    controlToken: "account-lifecycle-control-token-0123456789abcdef",
+    runtimeCommand: [process.execPath],
+    ...(accountRotation ? { accountRotation } : {}),
+  };
 }
 
 test("setup validates the port before performing runtime work", async () => {
@@ -333,6 +362,311 @@ test("authorized launcher uninstall does not re-probe an already stopped full ru
     expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
     expect(result.stdout).toContain("Uninstalled and removed private application data");
     expect(existsSync(appHome)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accounts login persists the successful direct Chrome identity and enables the workspace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-login-"));
+  const appHome = join(root, "app");
+  const preload = join(root, "login-preload.ts");
+  const slotStorage = join(appHome, "browser", "slots", "slot_one", "storage-state.json");
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [{ id: "account_one", name: "Account", credentialId: "primary" }],
+    credentials: [],
+    slots: [{
+      id: "slot_one",
+      accountId: "account_one",
+      label: "Workspace 1",
+      storageStatePath: slotStorage,
+      credentialId: "primary",
+    }],
+  }))}\n`);
+  saveRotationState({
+    nextIndex: 0,
+    cooldowns: { slot_one: Date.now() + 600_000, slot_other: Date.now() + 600_000 },
+  }, appHome);
+  writeFileSync(preload, `
+    import { mock } from "bun:test";
+    import { readFileSync, writeFileSync } from "node:fs";
+    import { join } from "node:path";
+    const original = await import(${JSON.stringify(resolve(import.meta.dir, "../src/browser-login.ts"))});
+    mock.module(${JSON.stringify(resolve(import.meta.dir, "../src/browser-login.ts"))}, () => ({
+      ...original,
+      loginToChatGpt: async (config) => {
+        const configPath = join(process.env.CODEX_CHATGPT_WEB_HOME, "config.json");
+        const concurrent = JSON.parse(readFileSync(configPath, "utf8"));
+        concurrent.appName = "Concurrent App Name";
+        writeFileSync(configPath, JSON.stringify(concurrent));
+        return {
+          storageStatePath: config.storageStatePath,
+          accountSurfaceUrl: "https://chatgpt.com/",
+          solAvailable: true,
+          proAvailable: false,
+          email: "person@example.com",
+          workspaceName: "Team Workspace",
+        };
+      },
+    }));
+  `);
+  try {
+    const result = await runCli(["accounts", "login", "slot_one"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    }, { preload });
+    const saved = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+
+    expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(saved.accountRotation.accounts[0].email).toBe("person@example.com");
+    expect(saved.appName).toBe("Concurrent App Name");
+    expect(saved.accountRotation.slots[0]).toMatchObject({
+      signedIn: true,
+      chatgptWorkspaceName: "Team Workspace",
+    });
+    expect(loadRotationState(appHome).cooldowns).toEqual({
+      slot_other: expect.any(Number),
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accounts login leaves the workspace disabled when direct Chrome login fails", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-login-fail-"));
+  const appHome = join(root, "app");
+  const preload = join(root, "login-preload.ts");
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [{ id: "account_one", name: "Account", credentialId: "primary" }],
+    credentials: [],
+    slots: [{
+      id: "slot_one",
+      accountId: "account_one",
+      label: "Workspace 1",
+      storageStatePath: join(appHome, "browser", "slots", "slot_one", "storage-state.json"),
+      credentialId: "primary",
+    }],
+  }))}\n`);
+  writeFileSync(preload, `
+    import { mock } from "bun:test";
+    const original = await import(${JSON.stringify(resolve(import.meta.dir, "../src/browser-login.ts"))});
+    mock.module(${JSON.stringify(resolve(import.meta.dir, "../src/browser-login.ts"))}, () => ({
+      ...original,
+      loginToChatGpt: async () => { throw new Error("login failed"); },
+    }));
+  `);
+  try {
+    const result = await runCli(["accounts", "login", "slot_one"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    }, { preload });
+    const saved = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+
+    expect(result.exitCode).toBe(1);
+    expect(saved.accountRotation.slots[0].signedIn).toBeUndefined();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accounts validate exits nonzero when any configured workspace is invalid", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-validate-"));
+  const appHome = join(root, "app");
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [{ id: "account_one", name: "Account", credentialId: "primary" }],
+    credentials: [],
+    slots: [{
+      id: "slot_one",
+      accountId: "account_one",
+      label: "Workspace 1",
+      storageStatePath: join(appHome, "browser", "slots", "slot_one", "storage-state.json"),
+      credentialId: "primary",
+    }],
+  }))}\n`);
+  try {
+    const result = await runCli(["accounts", "validate"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(result.stdout).ok).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit signed-in identity refresh clears only that workspace cooldown", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-refresh-"));
+  const appHome = join(root, "app");
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [
+      { id: "account_one", name: "One", credentialId: "primary" },
+      { id: "account_other", name: "Other", credentialId: "primary" },
+    ],
+    credentials: [],
+    slots: [
+      { id: "slot_one", accountId: "account_one", label: "One", storageStatePath: join(appHome, "browser", "slots", "slot_one", "storage-state.json"), credentialId: "primary", signedIn: false },
+      { id: "slot_other", accountId: "account_other", label: "Other", storageStatePath: join(appHome, "browser", "slots", "slot_other", "storage-state.json"), credentialId: "primary", signedIn: true },
+    ],
+  }))}\n`);
+  saveRotationState({
+    nextIndex: 1,
+    cooldowns: { slot_one: Date.now() + 600_000, slot_other: Date.now() + 600_000 },
+  }, appHome);
+  try {
+    const result = await runCli(["accounts", "update-identity", "slot_one", "--signed-in"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+    const saved = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+
+    expect(result.exitCode).toBe(0);
+    expect(saved.accountRotation.slots.find((slot: { id: string }) => slot.id === "slot_one").signedIn).toBe(true);
+    expect(loadRotationState(appHome)).toEqual({
+      nextIndex: 1,
+      cooldowns: { slot_other: expect.any(Number) },
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent account identity writers preserve every workspace update", async () => {
+  if (process.env.CODEX_SKIP_PROCESS_CONCURRENCY_TESTS === "1") return;
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-concurrent-"));
+  const appHome = join(root, "app");
+  mkdirSync(appHome, { recursive: true });
+  // Keep a real Windows multi-process race without triggering Bun 1.4.0's high fan-out crash.
+  const writerCount = process.platform === "win32" ? 4 : 12;
+  const slots = Array.from({ length: writerCount }, (_, index) => ({
+    id: `slot_${index}`,
+    accountId: `account_${index}`,
+    label: `Workspace ${index}`,
+    storageStatePath: join(appHome, "browser", "slots", `slot_${index}`, "storage-state.json"),
+    credentialId: "primary",
+    signedIn: false,
+  }));
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: slots.map((slot, index) => ({
+      id: slot.accountId,
+      name: `Account ${index}`,
+      credentialId: "primary",
+    })),
+    credentials: [],
+    slots,
+  }))}\n`);
+  try {
+    const results = await Promise.all(slots.map(slot => runCli(
+      ["accounts", "update-identity", slot.id, "--signed-in"],
+      { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome },
+    )));
+    expect(results.every(result => result.exitCode === 0)).toBeTrue();
+    const saved = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+    expect(saved.accountRotation.slots.filter((slot: { signedIn?: boolean }) => slot.signedIn === true)).toHaveLength(slots.length);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("account removal deletes only unreferenced app-owned storage and runtime keys", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-remove-"));
+  const appHome = join(root, "app");
+  const slotPath = (id: string) => join(appHome, "browser", "slots", id, "storage-state.json");
+  const sharedKey = join(appHome, "secrets", "runtime-key-cred_shared.key");
+  const uniqueKey = join(appHome, "secrets", "runtime-key-cred_unique.key");
+  const externalKey = join(root, "external.key");
+  const primaryStorage = join(appHome, "browser", "storage-state.json");
+  const primaryKey = join(appHome, "secrets", "runtime-key-primary.key");
+  for (const path of [primaryStorage, slotPath("slot_a"), slotPath("slot_b"), slotPath("slot_c"), slotPath("slot_d"), sharedKey, uniqueKey, externalKey, primaryKey]) {
+    mkdirSync(resolve(path, ".."), { recursive: true });
+    writeFileSync(path, "test\n", { mode: 0o600 });
+  }
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [
+      { id: "account_primary", name: "Primary", credentialId: "primary" },
+      { id: "account_a", name: "A", credentialId: "cred_shared" },
+      { id: "account_b", name: "B", credentialId: "cred_shared" },
+      { id: "account_c", name: "C", credentialId: "cred_unique" },
+      { id: "account_d", name: "D", credentialId: "cred_external" },
+    ],
+    credentials: [
+      { id: "primary", tunnelId: `tunnel_${"a".repeat(32)}`, runtimeKeyFile: primaryKey, alias: "primary", profileName: "profile" },
+      { id: "cred_shared", tunnelId: `tunnel_${"b".repeat(32)}`, runtimeKeyFile: sharedKey, alias: "shared", profileName: "profile" },
+      { id: "cred_unique", tunnelId: `tunnel_${"c".repeat(32)}`, runtimeKeyFile: uniqueKey, alias: "unique", profileName: "profile" },
+      { id: "cred_external", tunnelId: `tunnel_${"d".repeat(32)}`, runtimeKeyFile: externalKey, alias: "external", profileName: "profile" },
+    ],
+    slots: [
+      { id: "primary", accountId: "account_primary", label: "Primary", storageStatePath: primaryStorage, credentialId: "primary", signedIn: true },
+      { id: "slot_a", accountId: "account_a", label: "A", storageStatePath: slotPath("slot_a"), credentialId: "cred_shared", signedIn: true },
+      { id: "slot_b", accountId: "account_b", label: "B", storageStatePath: slotPath("slot_b"), credentialId: "cred_shared", signedIn: true },
+      { id: "slot_c", accountId: "account_c", label: "C", storageStatePath: slotPath("slot_c"), credentialId: "cred_unique", signedIn: true },
+      { id: "slot_d", accountId: "account_d", label: "D", storageStatePath: slotPath("slot_d"), credentialId: "cred_external", signedIn: true },
+    ],
+  }))}\n`);
+  try {
+    for (const accountId of ["account_a", "account_c", "account_d"]) {
+      const result = await runCli(["accounts", "remove-account", accountId], {
+        ...process.env,
+        CODEX_CHATGPT_WEB_HOME: appHome,
+      });
+      expect(result.exitCode).toBe(0);
+    }
+
+    expect(existsSync(resolve(slotPath("slot_a"), ".."))).toBe(false);
+    expect(existsSync(resolve(slotPath("slot_c"), ".."))).toBe(false);
+    expect(existsSync(resolve(slotPath("slot_d"), ".."))).toBe(false);
+    expect(existsSync(sharedKey)).toBe(true);
+    expect(existsSync(uniqueKey)).toBe(false);
+    expect(existsSync(externalKey)).toBe(true);
+    expect(existsSync(primaryStorage)).toBe(true);
+    expect(existsSync(primaryKey)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace removal deletes its unreferenced app-owned storage and runtime key", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-slot-remove-"));
+  const appHome = join(root, "app");
+  const storageDir = join(appHome, "browser", "slots", "slot_x");
+  const storageStatePath = join(storageDir, "storage-state.json");
+  const runtimeKeyFile = join(appHome, "secrets", "runtime-key-cred_x.key");
+  mkdirSync(storageDir, { recursive: true });
+  mkdirSync(resolve(runtimeKeyFile, ".."), { recursive: true });
+  writeFileSync(storageStatePath, "{}\n", { mode: 0o600 });
+  writeFileSync(runtimeKeyFile, "test\n", { mode: 0o600 });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [{ id: "account_x", name: "X", credentialId: "cred_x" }],
+    credentials: [{
+      id: "cred_x",
+      tunnelId: `tunnel_${"e".repeat(32)}`,
+      runtimeKeyFile,
+      alias: "account-x",
+      profileName: "profile",
+    }],
+    slots: [{
+      id: "slot_x",
+      accountId: "account_x",
+      label: "X",
+      storageStatePath,
+      credentialId: "cred_x",
+      signedIn: true,
+    }],
+  }))}\n`);
+  try {
+    const result = await runCli(["accounts", "remove", "slot_x"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+
+    expect(result.exitCode).toBe(0);
+    expect(existsSync(storageDir)).toBe(false);
+    expect(existsSync(runtimeKeyFile)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -5,7 +5,23 @@ import { timingSafeEqual } from "node:crypto";
 import { existsSync, rmSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
-import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup } from "./config";
+import { CHATGPT_CONNECTOR_NAME, getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, mutateConfig, persistAccountSlotIdentity } from "./config";
+import {
+  addAccountSlot,
+  addWorkspaceToAccount,
+  clearAccountSlotCooldown,
+  cleanupRemovedAccountArtifacts,
+  presentAccounts,
+  removeAccountRecord,
+  removeAccountSlot,
+  renameAccountRecord,
+  renameWorkspaceSlot,
+  rotationFromConfig,
+  setSlotCredentials,
+  uniqueCredentials,
+  updateAccountIdentity,
+} from "./account-rotation";
+import { validateAccountsStatic } from "./account-validation";
 import { inspectLauncherBrowserHost, readLauncherBrowserHostDescriptor } from "./launcher-browser-host";
 import {
   activateCodexIntegration,
@@ -47,6 +63,7 @@ Usage:
   codex-chatgpt-web mcp [--broker-socket PATH]
   codex-chatgpt-web service <status|install|start|restart|stop|cancel-turns>
   codex-chatgpt-web tunnel <status|start|restart|stop|key-import>
+  codex-chatgpt-web accounts <list|add|remove|login>
   codex-chatgpt-web open <tunnels|runtime-keys|connectors>
   codex-chatgpt-web uninstall --yes
 
@@ -67,6 +84,8 @@ Setup options:
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
+  --label NAME                 Account/workspace label for accounts add
+  --reuse-credentials ID       Reuse tunnel id + API key (same OpenAI account, different ChatGPT workspace)
   --bigger-context             Enable experimental adaptive 1/2/3-message context
   --standard-context           Disable experimental multi-message context
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
@@ -140,6 +159,166 @@ function authorizeLauncherControl(operation: string): void {
   if (expectedBytes.length !== suppliedBytes.length || !timingSafeEqual(expectedBytes, suppliedBytes)) {
     throw new Error(`Launcher-controlled ${operation} authorization is invalid`);
   }
+}
+
+async function accountsCommand(args: string[]): Promise<void> {
+  const action = args.shift() ?? "list";
+  const config = loadConfig();
+  if (action === "list") {
+    const rotation = rotationFromConfig(config);
+    stdout.write(`${JSON.stringify({
+      accounts: presentAccounts(rotation),
+      credentials: uniqueCredentials(rotation).map(credential => ({
+        id: credential.id,
+        tunnelId: credential.tunnelId,
+        alias: credential.alias,
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
+  if (action === "validate") {
+    assertNoArgs(args);
+    const report = validateAccountsStatic(config);
+    stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.ok) process.exitCode = 1;
+    return;
+  }
+  if (action === "add") {
+    const label = takeOption(args, "--label");
+    if (!label) throw new Error("accounts add requires --label");
+    const input = {
+      label,
+      reuseCredentialId: takeOption(args, "--reuse-credentials"),
+      tunnelId: takeOption(args, "--tunnel-id"),
+      runtimeKeyFile: takeOption(args, "--runtime-key-file"),
+      workspaceName: takeOption(args, "--workspace-name"),
+      asNewAccount: true,
+    };
+    assertNoArgs(args);
+    let added!: ReturnType<typeof addAccountSlot>;
+    mutateConfig(current => {
+      added = addAccountSlot(current, input);
+      return added.config as typeof current;
+    });
+    stdout.write(`${JSON.stringify({
+      ok: true,
+      slot: added.slot,
+      reusedCredentials: Boolean(added.slot.credentialId),
+    }, null, 2)}\n`);
+    stdout.write("Sign in on this slot (launcher: Accounts → Sign in, or `accounts login ID` for Chrome login).\n");
+    stdout.write("Each ChatGPT workspace still needs a Codex Native2 connector pointing at this slot's tunnel.\n");
+    return;
+  }
+  if (action === "add-workspace") {
+    const accountId = takeOption(args, "--account");
+    if (!accountId) throw new Error("accounts add-workspace requires --account");
+    const name = takeOption(args, "--label");
+    assertNoArgs(args);
+    let added!: ReturnType<typeof addWorkspaceToAccount>;
+    mutateConfig(current => {
+      added = addWorkspaceToAccount(current, { accountId, name });
+      return added.config as typeof current;
+    });
+    stdout.write(`${JSON.stringify({ ok: true, slot: added.slot }, null, 2)}\n`);
+    return;
+  }
+  if (action === "rename-account") {
+    const accountId = args.shift();
+    const name = takeOption(args, "--label");
+    if (!accountId || !name) throw new Error("accounts rename-account requires an id and --label");
+    assertNoArgs(args);
+    mutateConfig(current => renameAccountRecord(current, accountId, name) as typeof current);
+    stdout.write(`Renamed account ${accountId}\n`);
+    return;
+  }
+  if (action === "rename-workspace") {
+    const slotId = args.shift();
+    const name = takeOption(args, "--label");
+    if (!slotId || !name) throw new Error("accounts rename-workspace requires a slot id and --label");
+    assertNoArgs(args);
+    mutateConfig(current => renameWorkspaceSlot(current, slotId, name) as typeof current);
+    stdout.write(`Renamed workspace ${slotId}\n`);
+    return;
+  }
+  if (action === "update-identity") {
+    const slotId = args.shift();
+    if (!slotId) throw new Error("accounts update-identity requires a slot id");
+    const signedIn = takeFlag(args, "--signed-in");
+    const identity = {
+      email: takeOption(args, "--email"),
+      workspaceName: takeOption(args, "--workspace-name"),
+      ...(signedIn ? { signedIn: true } : {}),
+    };
+    assertNoArgs(args);
+    mutateConfig(current => updateAccountIdentity(current, slotId, identity) as typeof current);
+    if (signedIn) clearAccountSlotCooldown(slotId);
+    stdout.write(`Updated identity for ${slotId}\n`);
+    return;
+  }
+  if (action === "remove") {
+    const slotId = args.shift();
+    if (!slotId) throw new Error("accounts remove requires a slot id");
+    assertNoArgs(args);
+    mutateConfig(
+      current => removeAccountSlot(current, slotId) as typeof current,
+      cleanupRemovedAccountArtifacts,
+    );
+    stdout.write(`Removed account slot ${slotId}\n`);
+    return;
+  }
+  if (action === "remove-account") {
+    const accountId = args.shift();
+    if (!accountId) throw new Error("accounts remove-account requires an account id");
+    assertNoArgs(args);
+    mutateConfig(
+      current => removeAccountRecord(current, accountId) as typeof current,
+      cleanupRemovedAccountArtifacts,
+    );
+    stdout.write(`Removed account ${accountId}\n`);
+    return;
+  }
+  if (action === "login") {
+    const slotId = args.shift();
+    if (!slotId) throw new Error("accounts login requires a slot id");
+    assertNoArgs(args);
+    const slot = rotationFromConfig(config).slots.find(candidate => candidate.id === slotId);
+    if (!slot) throw new Error(`Unknown account slot ${JSON.stringify(slotId)}`);
+    if (config.browserHost === "launcher") {
+      throw new Error("Launcher-owned login: open Codex Web GPT → Settings → Accounts → Sign in for this slot");
+    }
+    const result = await loginToChatGpt({ ...config, storageStatePath: slot.storageStatePath });
+    persistAccountSlotIdentity(slotId, {
+      signedIn: true,
+      email: result.email,
+      workspaceName: result.workspaceName,
+    });
+    clearAccountSlotCooldown(slotId);
+    stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
+    return;
+  }
+  if (action === "set-credentials") {
+    const slotIds: string[] = [];
+    while (args[0] && !args[0].startsWith("--")) slotIds.push(args.shift()!);
+    if (slotIds.length === 0) throw new Error("accounts set-credentials requires one or more slot ids");
+    const input = {
+      reuseCredentialId: takeOption(args, "--reuse-credentials"),
+      tunnelId: takeOption(args, "--tunnel-id"),
+      runtimeKeyFile: takeOption(args, "--runtime-key-file"),
+    };
+    assertNoArgs(args);
+    const updated = mutateConfig(current => setSlotCredentials(current, slotIds, input) as typeof current);
+    stdout.write(`${JSON.stringify({
+      ok: true,
+      slots: slotIds,
+      credentials: uniqueCredentials(updated.accountRotation!).map(credential => ({
+        id: credential.id,
+        tunnelId: credential.tunnelId,
+        alias: credential.alias,
+      })),
+    }, null, 2)}\n`);
+    return;
+  }
+  throw new Error("Accounts command must be: accounts list | add | remove | login | set-credentials");
 }
 
 async function loginCommand(args: string[]): Promise<void> {
@@ -426,6 +605,7 @@ async function main(): Promise<void> {
   else if (command === "mcp") await runChatGptMcpMain(args);
   else if (command === "service") await serviceCommand(args);
   else if (command === "tunnel") await tunnelCommand(args);
+  else if (command === "accounts") await accountsCommand(args);
   else if (command === "open") await openCommand(args);
   else if (command === "uninstall") await uninstallCommand(args);
   else throw new Error(`Unknown command: ${command}\n\n${HELP}`);

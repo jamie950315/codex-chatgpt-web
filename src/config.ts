@@ -5,6 +5,8 @@ import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } f
 import { tmpdir } from "node:os";
 import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
+import { parseAccountRotation, PRIMARY_ACCOUNT_SLOT_ID, PRIMARY_CREDENTIAL_ID, updateAccountIdentity, type AccountRotationConfig } from "./account-rotation";
+import { withFileMutationLock } from "./file-lock";
 
 export type RuntimeMode = "browser-only" | "full";
 export type BrowserHostMode = "managed-chrome" | "launcher";
@@ -85,6 +87,8 @@ export interface AppConfig {
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
   tunnel?: TunnelConfig;
+  /** Extra ChatGPT logins used for per-turn rotation. Primary storageState/tunnel remain slot "primary". */
+  accountRotation?: AccountRotationConfig;
 }
 
 export function expandUserPath(value: string): string {
@@ -304,7 +308,10 @@ export function defaultChromeExecutable(
 }
 
 export function loadConfig(): AppConfig {
-  const path = getConfigPath();
+  return loadConfigAtPath(getConfigPath());
+}
+
+export function loadConfigAtPath(path: string): AppConfig {
   if (!existsSync(path)) throw new Error(`Configuration is missing: ${path}. Run codex-chatgpt-web setup first.`);
   return parseConfig(JSON.parse(stripUtf8Bom(readFileSync(path, "utf8"))), path);
 }
@@ -415,11 +422,15 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (proAvailable && !solAvailable) {
     throw new Error(`Invalid ChatGPT account capabilities in ${path}: Pro requires Sol`);
   }
+  const accountRotation = parsed.accountRotation === undefined
+    ? undefined
+    : parseAccountRotation(parsed.accountRotation, path);
   return {
     ...parsed,
     subagentProtocol,
     solAvailable,
     proAvailable,
+    ...(accountRotation ? { accountRotation } : {}),
     experimentalBiggerContext,
   } as AppConfig;
 }
@@ -430,7 +441,74 @@ export function saveConfig(config: AppConfig): void {
   atomicWriteFile(path, preserveUtf8Bom(`${JSON.stringify(config, null, 2)}\n`, original));
 }
 
-export function providerConfig(config: AppConfig): CodexProviderConfig {
+/** Save runtime/setup changes without replacing a newer account-rotation update. */
+export function saveConfigPreservingAccountRotation(config: AppConfig): AppConfig {
+  const home = getConfigDir();
+  const path = getConfigPath();
+  const lockPath = join(home, ".config-mutation.lock");
+  return withFileMutationLock(lockPath, "Timed out waiting to update ChatGPT configuration", () => {
+    if (!existsSync(path)) {
+      saveConfig(config);
+      return config;
+    }
+    const current = loadConfig();
+    const { accountRotation: _staleRotation, ...withoutStaleRotation } = config;
+    const latestRotation = current.accountRotation
+      ? {
+          ...current.accountRotation,
+          slots: current.accountRotation.slots.map(slot => (
+            slot.id === PRIMARY_ACCOUNT_SLOT_ID
+              ? { ...slot, storageStatePath: config.storageStatePath }
+              : slot
+          )),
+          credentials: current.accountRotation.credentials.map(credential => (
+            credential.id === PRIMARY_CREDENTIAL_ID && config.tunnel
+              ? {
+                  ...credential,
+                  tunnelId: config.tunnel.tunnelId,
+                  runtimeKeyFile: config.tunnel.runtimeKeyFile,
+                  alias: config.tunnel.alias,
+                  profileName: config.tunnel.profileName,
+                }
+              : credential
+          )),
+        }
+      : undefined;
+    const updated: AppConfig = {
+      ...withoutStaleRotation,
+      ...(latestRotation ? { accountRotation: latestRotation } : {}),
+    };
+    saveConfig(updated);
+    return updated;
+  });
+}
+
+export function mutateConfig(
+  mutate: (current: AppConfig) => AppConfig,
+  afterSave?: (before: AppConfig, after: AppConfig) => void,
+): AppConfig {
+  const home = getConfigDir();
+  const lockPath = join(home, ".config-mutation.lock");
+  return withFileMutationLock(lockPath, "Timed out waiting to update ChatGPT account configuration", () => {
+    const current = loadConfig();
+    const updated = mutate(current);
+    saveConfig(updated);
+    afterSave?.(current, updated);
+    return updated;
+  });
+}
+
+export function persistAccountSlotIdentity(
+  slotId: string,
+  identity: { email?: string; workspaceName?: string; signedIn?: boolean },
+): AppConfig {
+  return mutateConfig(current => updateAccountIdentity(current, slotId, identity) as AppConfig);
+}
+
+export function providerConfig(
+  config: AppConfig,
+  options: { liveConfigPath?: string } = {},
+): CodexProviderConfig {
   const model = config.solAvailable ? "gpt-5.6-sol" : "gpt-5.6-luna";
   const models = [model];
   const efforts = config.solAvailable
@@ -462,6 +540,8 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       proAvailable: config.proAvailable,
       experimentalBiggerContext: config.experimentalBiggerContext,
       autoApproveToolCalls: config.autoApproveToolCalls,
+      ...(options.liveConfigPath ? { accountRotationConfigPath: options.liveConfigPath } : {}),
+      ...(config.accountRotation ? { accountRotation: config.accountRotation } : {}),
     },
   };
 }

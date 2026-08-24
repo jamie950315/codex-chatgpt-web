@@ -236,6 +236,85 @@ describe("reversible native Codex route integration", () => {
     expect(readFileSync(configPath, "utf8")).toBe(original);
   });
 
+  test("changing the subagent protocol preserves a newer account login state", () => {
+    const { codexHome } = fixture();
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
+    const staleConfig = nativeConfig("browser-only");
+    staleConfig.accountRotation = {
+      accounts: [{ id: "account_primary", name: "Primary", credentialId: "credential_primary" }],
+      credentials: [{
+        id: "credential_primary",
+        tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        runtimeKeyFile: join(process.env.CODEX_CHATGPT_WEB_HOME!, "runtime.key"),
+        alias: "codex-chatgpt-web",
+        profileName: "codex-chatgpt-web",
+      }],
+      slots: [{
+        id: "slot_primary",
+        accountId: "account_primary",
+        label: "Primary",
+        storageStatePath: staleConfig.storageStatePath,
+        credentialId: "credential_primary",
+        signedIn: true,
+      }],
+    };
+    saveConfig(staleConfig);
+    installCodexIntegration(staleConfig);
+    saveConfig({
+      ...staleConfig,
+      accountRotation: {
+        ...staleConfig.accountRotation,
+        slots: staleConfig.accountRotation.slots.map(slot => ({ ...slot, signedIn: false })),
+      },
+    });
+
+    setCodexSubagentProtocol(staleConfig, "compatibility-v1");
+
+    expect(loadConfig().accountRotation?.slots[0]?.signedIn).toBe(false);
+  });
+
+  test("a config transaction updates the preserved primary rotation credential", () => {
+    const { codexHome, appHome } = fixture();
+    writeFileSync(join(codexHome, "config.toml"), 'model = "gpt-5.6-sol"\n');
+    const current = nativeConfig("full");
+    const oldTunnel = {
+      binaryPath: join(appHome, "tmate"),
+      tunnelId: "tunnel_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      runtimeKeyFile: join(appHome, "old.key"),
+      profileDir: join(appHome, "profiles"),
+      profileName: "codex-chatgpt-web",
+      alias: "codex-chatgpt-web",
+    };
+    current.tunnel = oldTunnel;
+    current.accountRotation = {
+      accounts: [{ id: "account_primary", name: "Primary", credentialId: "primary" }],
+      credentials: [{ id: "primary", ...oldTunnel }],
+      slots: [{
+        id: "primary",
+        accountId: "account_primary",
+        label: "Primary",
+        storageStatePath: current.storageStatePath,
+        credentialId: "primary",
+        signedIn: false,
+      }],
+    };
+    saveConfig(current);
+    installCodexIntegration(current);
+    const nextTunnel = {
+      ...oldTunnel,
+      tunnelId: "tunnel_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      runtimeKeyFile: join(appHome, "new.key"),
+    };
+
+    setCodexSubagentProtocol({ ...current, tunnel: nextTunnel }, "compatibility-v1");
+
+    const saved = loadConfig();
+    expect(saved.tunnel?.tunnelId).toBe(nextTunnel.tunnelId);
+    expect(saved.accountRotation?.credentials.find(credential => credential.id === "primary"))
+      .toMatchObject({ tunnelId: nextTunnel.tunnelId, runtimeKeyFile: nextTunnel.runtimeKeyFile });
+    expect(saved.accountRotation?.slots[0]?.signedIn).toBe(false);
+  });
+
   test("Compatibility V1 refuses to overwrite a newer agent depth edit", () => {
     const { codexHome } = fixture();
     const configPath = join(codexHome, "config.toml");

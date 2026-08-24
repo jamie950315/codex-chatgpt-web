@@ -15,7 +15,12 @@ const {
   shell,
   Tray,
 } = require("electron");
-const { BrowserHost } = require("./browser-host.cjs");
+const {
+  accountIdentityUpdate,
+  BrowserHost,
+  createSerialTaskQueue,
+  reconcileAccountValidationReport,
+} = require("./browser-host.cjs");
 const { BrowserControlServer } = require("./control-server.cjs");
 const { getAutostart, setAutostart } = require("./autostart.cjs");
 const {
@@ -27,6 +32,7 @@ const {
 const { RuntimeHost } = require("./runtime.cjs");
 const { ensurePackagedRuntime } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
+const { shutdownFailureMessage } = require("./shutdown-result.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
 const { createUpdateController } = require("./update.cjs");
@@ -79,6 +85,7 @@ let browserHost = null;
 let runtimeHost = null;
 let browserControl = null;
 let runtimeSupervisor = null;
+const accountIdentityCaptures = createSerialTaskQueue();
 let tray = null;
 let quitting = false;
 let shutdownInProgress = false;
@@ -352,6 +359,14 @@ function validateBounds(value) {
   return value;
 }
 
+function compactConnectorValidationMessage(message, connectorName) {
+  const first = String(message || "").split("\n")[0].trim();
+  if (/locator\.waitFor:\s*Timeout/i.test(first) || /Timeout \d+ms exceeded/i.test(first)) {
+    return `ChatGPT did not attach connector ${JSON.stringify(connectorName)} in this workspace. Open a new Temporary Chat here, type @${connectorName}, and enable that connector if it is missing.`;
+  }
+  return first.length > 280 ? `${first.slice(0, 277)}…` : first;
+}
+
 function smokePassedForCurrentVersion(state) {
   return state.browserSmokePassed === true && state.browserSmokeVersion === app.getVersion();
 }
@@ -369,6 +384,7 @@ function registerIpc({ logger, stateStore }) {
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
+    accounts: runtimeHost?.listAccounts?.() ?? { accounts: [], primaryTunnelId: "" },
     logs: logger.recent(),
     urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
     platform: process.platform,
@@ -413,13 +429,147 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:browser-zoom", (_event, action) => browserHost.zoom(action));
   handle("launcher:browser-tab-select", (_event, tabId) => browserHost.selectTab(tabId));
   handle("launcher:browser-tab-close", (_event, tabId) => browserHost.closeTab(tabId));
-  handle("launcher:browser-login", async () => {
-    const browser = await browserHost.openLogin();
+  handle("launcher:browser-login", async (_event, input) => {
+    const partition = typeof input?.partition === "string" ? input.partition : undefined;
+    const waitForWorkspace = input?.waitForWorkspace === true;
+    const rejectWorkspaceNames = [];
+    if (waitForWorkspace && input?.slotId) {
+      const current = runtimeHost.listAccounts();
+      const account = (current.accounts || []).find((item) => (
+        (item.workspaces || []).some((workspace) => workspace.id === input.slotId)
+      ));
+      for (const workspace of account?.workspaces || []) {
+        if (workspace.id !== input.slotId && workspace.chatgptWorkspaceName) {
+          rejectWorkspaceNames.push(workspace.chatgptWorkspaceName);
+        }
+      }
+    }
+    const persistIdentity = async (identity = {}) => {
+      if (!input?.slotId) return;
+      try {
+        await runtimeHost.updateAccountIdentity({
+          slotId: input.slotId,
+          email: identity.email,
+          workspaceName: identity.workspaceName,
+          signedIn: true,
+        });
+      } catch (error) {
+        logger.warn("accounts.identity_update_failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+    const browser = await browserHost.openLogin(partition, {
+      slotId: input?.slotId,
+      waitForWorkspace,
+      rejectWorkspaceNames,
+      onSignedIn: persistIdentity,
+    });
+    await persistIdentity(browser?.identity || {});
     if (browser.authenticated) {
       const state = stateStore.update({ sessionRefreshReminderAt: nextSessionRefreshReminderAt() });
       send("launcher:state-changed", state);
     }
-    return browser;
+    return { ...browser, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-capture-identities", async () => {
+    return accountIdentityCaptures.enqueue(async () => {
+      const accounts = runtimeHost.listAccounts();
+      const captured = [];
+      for (const account of accounts.accounts || []) {
+        for (const workspace of account.workspaces || []) {
+          try {
+            const identity = await browserHost.readChatGptIdentityForPartition(workspace.partition);
+            const update = accountIdentityUpdate(workspace.id, identity);
+            if (update) captured.push(update);
+          } catch (error) {
+            logger.warn("accounts.identity_capture_failed", {
+              slotId: workspace.id,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+      for (const identity of captured) {
+        try {
+          await runtimeHost.updateAccountIdentity(identity);
+        } catch (error) {
+          logger.warn("accounts.identity_update_failed", {
+            slotId: identity.slotId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return { accounts: runtimeHost.listAccounts() };
+    });
+  });
+  handle("launcher:accounts-validate", async () => {
+    await accountIdentityCaptures.wait();
+    try {
+      await runtimeSupervisor.startIfConfigured();
+    } catch (error) {
+      logger.warn("accounts.validate_runtime_start_failed", {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const listed = runtimeHost.listAccounts();
+    const staticResult = await runtimeHost.validateAccounts();
+    let report;
+    try {
+      const stdout = String(staticResult.stdout || "");
+      report = JSON.parse(stdout.slice(stdout.indexOf("{"), stdout.lastIndexOf("}") + 1));
+      reconcileAccountValidationReport(listed, report);
+    } catch {
+      throw new Error("Account validation did not return a report");
+    }
+    const connectorName = runtimeHost.mcpConnectorName();
+    const accounts = [];
+    for (const account of report.accounts || []) {
+      const listedAccount = (listed.accounts || []).find((item) => item.id === account.id);
+      const workspaces = [];
+      for (const workspace of account.workspaces || []) {
+        const listedWorkspace = (listedAccount?.workspaces || []).find((item) => item.id === workspace.id);
+        const partition = listedWorkspace?.partition;
+        let login = workspace.login || { status: "error", message: "Not signed in to ChatGPT on this workspace" };
+        try {
+          if (partition) login = await browserHost.probePartitionLogin(partition);
+        } catch (error) {
+          login = {
+            status: "error",
+            message: error instanceof Error ? error.message : String(error),
+          };
+        }
+        let connector = { status: "skipped", message: "Sign in before checking the Codex connector" };
+        if (login.status === "ok") {
+          const mode = runtimeHost.runtimeConfigSnapshot?.().mode;
+          if (mode !== "full") {
+            connector = { status: "skipped", message: "Browser-only mode has no MCP connector" };
+          } else {
+            try {
+              await browserHost.runConnectorVerification(connectorName, partition);
+              connector = { status: "ok", message: `Codex connector ${JSON.stringify(connectorName)} is available` };
+            } catch (error) {
+              connector = {
+                status: "error",
+                message: compactConnectorValidationMessage(
+                  error instanceof Error ? error.message : String(error),
+                  connectorName,
+                ),
+              };
+            }
+          }
+        }
+        workspaces.push({ ...workspace, login, connector });
+      }
+      accounts.push({ ...account, workspaces });
+    }
+    return {
+      ok: accounts.every((account) => (
+        account.tunnel?.status !== "error"
+        && account.workspaces.every((workspace) => workspace.login.status !== "error" && workspace.connector?.status !== "error")
+      )),
+      accounts,
+    };
   });
   handle("launcher:browser-logout", async () => {
     const browser = await browserHost.logout();
@@ -605,6 +755,49 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
   });
+  handle("launcher:accounts-add-workspace", async (_event, input) => {
+    const result = await runtimeHost.addWorkspace(input || {});
+    await browserHost?.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-rename-account", async (_event, input) => {
+    const result = await runtimeHost.renameAccount(input || {});
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-rename-workspace", async (_event, input) => {
+    const result = await runtimeHost.renameWorkspace(input || {});
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-add", async (_event, input) => {
+    const result = await runtimeHost.addAccount(input || {});
+    await browserHost?.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-set-credentials", async (_event, input) => {
+    const result = await runtimeHost.setAccountCredentials(input || {});
+    await browserHost?.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-remove", async (_event, slotId) => {
+    const result = await runtimeHost.removeAccount(slotId);
+    await browserHost?.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
+  handle("launcher:accounts-remove-account", async (_event, input) => {
+    const result = await runtimeHost.removeAccountRecord(input || {});
+    await browserHost?.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+    return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
+  });
   handle("launcher:setup-mcp", async (_event, input) => {
     await browserHost.reveal();
     const setup = IS_DEV_PROFILE
@@ -703,7 +896,9 @@ async function requestQuit() {
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
     }
-    await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    const shutdown = await runtimeSupervisor?.shutdown({ cancelActiveTurns: true, force: true });
+    const shutdownFailure = shutdownFailureMessage(shutdown);
+    if (shutdownFailure) throw new Error(shutdownFailure);
     stopCatalogVerificationMonitor();
     quitting = true;
     await browserHost?.persistSession();
@@ -835,6 +1030,15 @@ async function start() {
     publishState: (state) => send("launcher:browser-state", state),
   });
   await browserHost.ready();
+  try {
+    await browserHost.syncAccountKeepalives(
+      (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+    );
+  } catch (error) {
+    logger.warn("browser.account_keepalive_sync_failed", {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
   const updaterRuntimeRoot = runtimeRootProvider();
   updateController = createUpdateController({
     currentVersion: app.getVersion(),

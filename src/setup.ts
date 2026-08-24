@@ -11,7 +11,7 @@ import {
   loadConfigForSetup,
   resolveDevSetupConnectorName,
   resolveSetupConnectorName,
-  saveConfig,
+  saveConfigPreservingAccountRotation,
 } from "./config";
 import {
   browserLoginStateExists,
@@ -38,7 +38,7 @@ import {
   restartService,
   uninstallService,
 } from "./service";
-import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
+import { connectConfiguredTunnels, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
 
@@ -287,7 +287,7 @@ async function bootstrapTunnelProfile(config: AppConfig): Promise<void> {
     // `runtimes connect` writes the native profile and returns once its managed runtime is healthy.
     // Readiness follows after a successful control-plane poll, so setup proves it separately before
     // stopping the validation runtime. The launcher supervisor reconnects the committed profile.
-    connectTunnel(config);
+    connectConfiguredTunnels(config);
     const status = await waitForTunnelReady(config);
     if (!status.ok) throw new Error(`Tunnel runtime did not become healthy and ready: ${status.detail}`);
   } catch (error) {
@@ -409,7 +409,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
 
   if (!launcherOwned) {
-    saveConfig(config);
+    saveConfigPreservingAccountRotation(config);
     installService(config);
     if (changedWhileLoaded && options.restartService && existing) await restartService(existing);
     await waitForProxy(config);
@@ -449,7 +449,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (launcherOwned && (beforeService.installed || beforeService.loaded)) {
     await uninstallService(existing!);
   }
-  if (launcherOwned) saveConfig(config);
+  if (launcherOwned) saveConfigPreservingAccountRotation(config);
   // Keep the previous terminal runtime intact through the ownership handoff. A later launcher
   // setup removes it once the launcher-owned configuration is already the established baseline.
   const migratingTerminalRuntime = Boolean(
@@ -514,7 +514,7 @@ export async function setupDevProfile(options: SetupOptions): Promise<DevProfile
     }
     tunnelReady = false;
   }
-  saveConfig(config);
+  saveConfigPreservingAccountRotation(config);
   return {
     mode: config.mode,
     configPath: getConfigPath(),

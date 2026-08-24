@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-import { defaultBrokerEndpoint, expandUserPath, resolveBrokerEndpoint } from "../../config";
+import { defaultBrokerEndpoint, expandUserPath, loadConfigAtPath, persistAccountSlotIdentity, resolveBrokerEndpoint } from "../../config";
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import type { ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
@@ -10,6 +11,7 @@ import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./env
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { chatGptWebTurnRetryPolicy } from "./retry-policy";
+import { claimAccountSlot, coolAccountSlot, NO_ACCOUNT_SLOTS_MESSAGE, type SelectedAccountSlot } from "../../account-rotation";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult, type TurnBrokerOwner } from "./turn-broker";
 import { ChatGptTextFeed, ChatGptTraceFeed, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey, chatGptTurnRetryKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage, resolveBiggerContextMultipartParts } from "./usage";
@@ -200,11 +202,85 @@ function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequ
   }
 }
 
+const ROTATION_CLAIM_TTL_MS = 30 * 60_000;
+const rotationClaims = new Map<string, {
+  selected: SelectedAccountSlot;
+  updatedAt: number;
+  blockedError?: ChatGptWebAdapterError;
+}>();
+
+function releaseRotationClaim(key: string): void {
+  rotationClaims.delete(key);
+}
+
+function pruneRotationClaims(now = Date.now()): void {
+  for (const [key, claim] of rotationClaims) {
+    if (now - claim.updatedAt >= ROTATION_CLAIM_TTL_MS) rotationClaims.delete(key);
+  }
+}
+
+function blockRotationClaim(key: string, error: ChatGptWebAdapterError): void {
+  const claim = rotationClaims.get(key);
+  if (claim) claim.blockedError = error;
+}
+
+function bindProviderToRotatedAccount(provider: CodexProviderConfig, claimKey: string): CodexProviderConfig {
+  const now = Date.now();
+  pruneRotationClaims(now);
+  const claimed = rotationClaims.get(claimKey);
+  if (claimed) {
+    claimed.updatedAt = now;
+    return {
+      ...provider,
+      chatgptWeb: {
+        ...provider.chatgptWeb,
+        storageStatePath: claimed.selected.slot.storageStatePath,
+        rotationSlotId: claimed.selected.slot.id,
+        launcherPartition: claimed.selected.partition,
+      },
+    };
+  }
+  let rotation = provider.chatgptWeb?.accountRotation;
+  let storageStatePath = provider.chatgptWeb?.storageStatePath;
+  const liveConfigPath = provider.chatgptWeb?.accountRotationConfigPath;
+  if (liveConfigPath && existsSync(liveConfigPath)) {
+    const current = loadConfigAtPath(liveConfigPath);
+    rotation = current.accountRotation;
+    storageStatePath = current.storageStatePath;
+  }
+  if (!rotation) {
+    if (storageStatePath === provider.chatgptWeb?.storageStatePath) return provider;
+    return {
+      ...provider,
+      chatgptWeb: {
+        ...provider.chatgptWeb,
+        accountRotation: undefined,
+        storageStatePath,
+      },
+    };
+  }
+  if (rotation.slots.length === 0) throw new Error(NO_ACCOUNT_SLOTS_MESSAGE);
+  const selected = claimAccountSlot({
+    storageStatePath: storageStatePath ?? "",
+    accountRotation: rotation,
+  });
+  rotationClaims.set(claimKey, { selected, updatedAt: now });
+  console.info(`[chatgpt-web] using account slot ${selected.slot.id} (${selected.slot.label})`);
+  return {
+    ...provider,
+    chatgptWeb: {
+      ...provider.chatgptWeb,
+      storageStatePath: selected.slot.storageStatePath,
+      rotationSlotId: selected.slot.id,
+      launcherPartition: selected.partition,
+    },
+  };
+}
+
 export function createChatGptWebAdapter(
   provider: CodexProviderConfig,
   dependencies: { broker?: TurnBrokerOwner } = {},
 ): ProviderAdapter {
-  const worker = ChatGptBrowserWorker.forProvider(provider);
   const broker = dependencies.broker ?? TurnBroker.forSocket(brokerSocketPath(provider));
   const timeoutMs = provider.chatgptWeb?.turnTimeoutMs;
   const experimentalBiggerContext = provider.chatgptWeb?.experimentalBiggerContext;
@@ -238,7 +314,11 @@ export function createChatGptWebAdapter(
     environment: ReturnType<typeof extractChatGptTurnEnvironment> | undefined,
     traceId: string,
     turnCapabilities: ChatGptWebCapabilities,
+    claimKey: string,
   ): ChatGptTurnRuntime => {
+    const boundProvider = bindProviderToRotatedAccount(provider, claimKey);
+    const worker = ChatGptBrowserWorker.forProvider(boundProvider);
+    const rotationSlotId = boundProvider.chatgptWeb?.rotationSlotId;
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
     const identity = extractChatGptTurnIdentity(parsed);
     const captureLunaCheckpoint = parsed.modelId === CHATGPT_WEB_LUNA_MODEL_ID
@@ -310,6 +390,7 @@ export function createChatGptWebAdapter(
         trace,
         text,
         cancel: browserTurn.cancel,
+        ...(rotationSlotId ? { rotationSlotId } : {}),
       };
     }
     if (!environment) throw new Error("Tool-capable ChatGPT web mode requires a trusted Codex environment");
@@ -365,6 +446,7 @@ export function createChatGptWebAdapter(
       browser: browserTurn.browser,
       trace,
       text,
+      ...(rotationSlotId ? { rotationSlotId } : {}),
       cancel: (reason?: Error) => {
         browserTurn.cancel(reason);
         if (activeToken) {
@@ -384,8 +466,10 @@ export function createChatGptWebAdapter(
         : configuredCapabilities;
       const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, turnCapabilities);
       const retryKey = `${executionNamespace}:${chatGptTurnRetryKey(parsed)}`;
+      pruneRotationClaims();
       const exhaustedRetry = chatGptWebTurnRetryPolicy.exhaustedError(retryKey);
       if (exhaustedRetry) {
+        releaseRotationClaim(retryKey);
         emit({
           type: "error",
           message: exhaustedRetry.message,
@@ -393,6 +477,25 @@ export function createChatGptWebAdapter(
           errorType: exhaustedRetry.errorType,
           code: exhaustedRetry.code,
           retryable: false,
+        });
+        return;
+      }
+      const blockedClaim = rotationClaims.get(retryKey);
+      if (blockedClaim?.blockedError) {
+        const handledError = new ChatGptWebAdapterError(blockedClaim.blockedError.message, {
+          status: blockedClaim.blockedError.status,
+          errorType: blockedClaim.blockedError.errorType,
+          code: blockedClaim.blockedError.code,
+          retryable: false,
+        });
+        chatGptWebTurnRetryPolicy.clear(retryKey);
+        emit({
+          type: "error",
+          message: handledError.message,
+          status: handledError.status,
+          errorType: handledError.errorType,
+          code: handledError.code,
+          retryable: handledError.retryable,
         });
         return;
       }
@@ -417,7 +520,7 @@ export function createChatGptWebAdapter(
       const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
       const session = chatGptTurnSessions.getOrCreate(
         executionKey,
-        () => startRuntime(parsed, environment, traceId, turnCapabilities),
+        () => startRuntime(parsed, environment, traceId, turnCapabilities, retryKey),
         traceId,
       );
       const heartbeat = setInterval(() => emit({ type: "heartbeat" }), 10_000);
@@ -450,6 +553,7 @@ export function createChatGptWebAdapter(
             }
             emitBrowserCompletion(settled, estimateChatGptWebUsage(currentUsageInput(parsed), { answer: settled.answer, reasoning }, turnCapabilities), emit);
             chatGptWebTurnRetryPolicy.clear(retryKey);
+            releaseRotationClaim(retryKey);
             return;
           }
 
@@ -538,6 +642,7 @@ export function createChatGptWebAdapter(
                   emit,
                 );
                 chatGptWebTurnRetryPolicy.clear(retryKey);
+                releaseRotationClaim(retryKey);
                 return;
               }
               if (!turnToken || session.runtime.mode !== "tools") {
@@ -558,11 +663,32 @@ export function createChatGptWebAdapter(
           }
         });
       } catch (error) {
+        if (error instanceof ChatGptWebAdapterError
+          && (error.code === "rate_limit_exceeded" || error.code === "chatgpt_session_expired")
+          && session.runtime.rotationSlotId) {
+          blockRotationClaim(retryKey, error);
+          try {
+            coolAccountSlot(session.runtime.rotationSlotId);
+            console.info(`[chatgpt-web] cooling account slot ${session.runtime.rotationSlotId} after ${error.code}`);
+          } catch (persistError) {
+            console.warn(`[chatgpt-web] failed to persist cooldown for account slot ${session.runtime.rotationSlotId}: ${persistError instanceof Error ? persistError.message : String(persistError)}`);
+          }
+          if (error.code === "chatgpt_session_expired") {
+            try {
+              persistAccountSlotIdentity(session.runtime.rotationSlotId, { signedIn: false });
+            } catch (persistError) {
+              console.warn(`[chatgpt-web] failed to persist signed-out account slot ${session.runtime.rotationSlotId}: ${persistError instanceof Error ? persistError.message : String(persistError)}`);
+            }
+          }
+        }
         const handledError = error instanceof ChatGptWebAdapterError && error.retryable
           ? chatGptWebTurnRetryPolicy.recordRetryableFailure(retryKey, error)
           : error;
         if (!(error instanceof ChatGptWebAdapterError && error.retryable)) {
           chatGptWebTurnRetryPolicy.clear(retryKey);
+        }
+        if (!(handledError instanceof ChatGptWebAdapterError) || !handledError.retryable) {
+          releaseRotationClaim(retryKey);
         }
         if (handledError instanceof ChatGptWebAdapterError && !handledError.retryable) {
           // A deterministic request failure remains replayable so a native reconnect cannot burn

@@ -9,6 +9,9 @@ const stylesSource = fs.readFileSync(path.join(launcherRoot, "src", "styles.css"
 const electronMain = fs.readFileSync(path.join(launcherRoot, "electron", "main.cjs"), "utf8");
 const browserHostSource = fs.readFileSync(path.join(launcherRoot, "electron", "browser-host.cjs"), "utf8");
 const preloadSource = fs.readFileSync(path.join(launcherRoot, "electron", "preload.cjs"), "utf8");
+const settingsStart = appSource.indexOf("function SettingsSurface(");
+const settingsEnd = appSource.indexOf("function ValidationNote(", settingsStart);
+const settingsSource = appSource.slice(settingsStart, settingsEnd);
 
 test("embedded ChatGPT is measured only after its animated surface mounts", () => {
   assert.match(appSource, /const \[browserSlot, setBrowserSlot\] = useState<HTMLDivElement \| null>\(null\)/);
@@ -40,6 +43,19 @@ test("closing the launcher follows the persisted background-runtime preference",
     /if \(stateStore\.read\(\)\.keepRunningOnClose && tray\) window\.hide\(\);\s*else void requestQuit\(\);/,
   );
   assert.match(appSource, /setPreference\("keepRunningOnClose", checked\)/);
+});
+
+test("opening Settings refreshes the account snapshot without scanning every ChatGPT identity", () => {
+  assert.ok(settingsStart >= 0 && settingsEnd > settingsStart, "Settings surface must remain defined");
+  assert.match(settingsSource, /api!\.snapshot\(\)[\s\S]*?next\.accounts[\s\S]*?setAccounts\(next\.accounts\)/);
+  assert.doesNotMatch(settingsSource, /captureIdentities\(/);
+  assert.doesNotMatch(settingsSource, /capturingIdentities|setCapturingIdentities/);
+});
+
+test("read-only account validation does not lock account mutation controls", () => {
+  assert.match(settingsSource, /const accountsBusy = busy;/);
+  assert.match(settingsSource, /setValidating\(true\)[\s\S]*?api!\.validateAccounts\(\)[\s\S]*?setValidating\(false\)/);
+  assert.doesNotMatch(settingsSource, /const accountsBusy = busy \|\| validating/);
 });
 
 test("normal shutdown persists the ChatGPT session before closing browser views", () => {

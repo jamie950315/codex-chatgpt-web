@@ -99,6 +99,22 @@ test("browser turns have no absolute deadline unless one is explicitly configure
   })).toThrow("turnTimeoutMs must be a positive finite number");
 });
 
+test("launcher surface routing survives browser config normalization", () => {
+  const resolved = resolveBrowserConfig({
+    adapter: "chatgpt-web",
+    baseUrl: "browser://chatgpt",
+    chatgptWeb: {
+      browserHost: "launcher",
+      browserHostDescriptorPath: "/tmp/launcher-browser.json",
+      launcherPartition: "persist:codex-web-gpt-chatgpt-slot_us",
+      surfaceId: "slot_us",
+    },
+  });
+
+  expect(resolved.launcherPartition).toBe("persist:codex-web-gpt-chatgpt-slot_us");
+  expect(resolved.surfaceId).toBe("slot_us");
+});
+
 test("managed Chrome defaults follow the host platform", () => {
   expect(defaultChromeExecutable("darwin")).toBe("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
   expect(defaultChromeExecutable("linux")).toBe("/usr/bin/google-chrome");
@@ -671,6 +687,42 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
   }
 });
 
+test("connector verification succeeds from the mention catalog without attaching a pill", async () => {
+  const calls: string[] = [];
+  const appResult = {
+    waitFor: async () => { calls.push("menu"); },
+    count: async () => 1,
+  };
+  const composer = {
+    fill: async () => { calls.push("clear"); },
+    focus: async () => { calls.push("focus"); },
+    pressSequentially: async () => { calls.push("type"); },
+  };
+  const page = {
+    getByText: () => ({ exactConnectorLabel: true }),
+    locator: () => ({
+      filter: () => appResult,
+    }),
+    keyboard: {
+      press: async () => {
+        throw new Error("verification must not attach the connector pill");
+      },
+    },
+  };
+  const prototype = ChatGptBrowserWorker.prototype as unknown as {
+    verifyConnectorExclusive(): Promise<string>;
+  };
+  const selected = await prototype.verifyConnectorExclusive.call({
+    config: { appName: "Codex Native2" },
+    ensurePage: async () => page,
+    prepareTemporaryChatSurface: async () => { calls.push("prepare"); },
+    activeComposer: async () => composer,
+    connectorIsSelected: async () => false,
+  });
+  expect(selected).toBe("Codex Native2");
+  expect(calls).toEqual(["prepare", "clear", "clear", "focus", "type", "menu"]);
+});
+
 test("production connector diagnostics distinguish an existing DEV connector", async () => {
   const connectorMentionFailure = (ChatGptBrowserWorker.prototype as unknown as {
     connectorMentionFailure(menuRows: unknown, attempts: number): Promise<string>;
@@ -978,6 +1030,8 @@ test("effort selection handles the known ChatGPT rate-limit dialog before backgr
 
   expect(workerSource).toContain("Too many requests");
   expect(workerSource).toContain("making requests too quickly");
+  expect(workerSource).toContain("太多要求");
+  expect(workerSource).toContain("知道了");
   expect(guard).toBeGreaterThan(-1);
   expect(activation).toBeGreaterThan(guard);
   expect(selectionSource).not.toContain('currentEffort.press("Enter")');
@@ -1038,26 +1092,29 @@ test("an unrelated Continue dialog is never auto-accepted", async () => {
 });
 
 function dialogPage(text: string): { page: Page; pressed: string[] } {
-  let matches = true;
   const pressed: string[] = [];
-  const button = {
-    last: () => button,
-    isVisible: async () => matches,
-    press: async (key: string) => { pressed.push(key); },
-  };
-  const dialog = {
-    filter: ({ hasText }: { hasText: string | RegExp }) => {
-      matches &&= typeof hasText === "string" ? text.includes(hasText) : hasText.test(text);
-      return dialog;
-    },
-    last: () => dialog,
-    isVisible: async () => matches,
-    getByRole: () => button,
+  const newDialog = () => {
+    let matches = true;
+    const button = {
+      last: () => button,
+      isVisible: async () => matches,
+      press: async (key: string) => { pressed.push(key); },
+    };
+    const dialog = {
+      filter: ({ hasText }: { hasText: string | RegExp }) => {
+        matches &&= typeof hasText === "string" ? text.includes(hasText) : hasText.test(text);
+        return dialog;
+      },
+      last: () => dialog,
+      isVisible: async () => matches,
+      getByRole: () => button,
+    };
+    return dialog;
   };
   return {
     page: {
-      locator: () => dialog,
-      getByText: (hasText: string | RegExp) => dialog.filter({ hasText }),
+      locator: () => newDialog(),
+      getByText: (hasText: string | RegExp) => newDialog().filter({ hasText }),
     } as unknown as Page,
     pressed,
   };
@@ -1073,6 +1130,19 @@ test("the known ChatGPT rate-limit dialog is acknowledged and returns a structur
     code: "rate_limit_exceeded",
     retryable: true,
     message: "ChatGPT rate limit: too many requests. Try again in a few minutes.",
+  });
+  expect(fixture.pressed).toEqual(["Enter"]);
+});
+
+test("the Traditional Chinese ChatGPT rate-limit dialog is acknowledged and returns a structured 429", async () => {
+  const fixture = dialogPage("太多要求 你的要求過於頻繁。為了保護你的資料，我們已暫時限制了你的對話存取權限。請稍等幾分鐘後再試一次。");
+
+  await expect(throwIfChatGptRateLimitDialog(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 429,
+    errorType: "rate_limit_error",
+    code: "rate_limit_exceeded",
+    retryable: true,
   });
   expect(fixture.pressed).toEqual(["Enter"]);
 });
@@ -1110,6 +1180,70 @@ test("a failed subscription fetch is retryable and does not falsely invalidate C
     errorType: "server_error",
     code: "chatgpt_subscription_unavailable",
     retryable: true,
+  });
+});
+
+test.each([
+  "Your session has expired. Please log in again to continue using the app. Log in",
+  "你的工作階段已過期 請重新登入以繼續使用應用程式。 登入",
+])("an expired ChatGPT session returns a structured authentication failure: %s", async alertText => {
+  const fixture = dialogPage(alertText);
+
+  await expect(throwIfChatGptSessionFailureAlert(fixture.page)).rejects.toMatchObject({
+    name: "ChatGptWebAdapterError",
+    status: 401,
+    errorType: "authentication_error",
+    code: "chatgpt_session_expired",
+    retryable: true,
+  });
+});
+
+test("effort selection stops as soon as ChatGPT reports an expired session", async () => {
+  const neverVisible = new Promise<void>(() => {});
+  const effortControl = {
+    last() { return this; },
+    waitFor: async () => await neverVisible,
+  };
+  const composerForm = { locator: () => effortControl };
+  const composer = { locator: () => composerForm };
+  const sessionAlert = {
+    filter() { return this; },
+    last() { return this; },
+    waitFor: async () => {},
+    isVisible: async () => true,
+  };
+  const hiddenDialog = {
+    filter() { return this; },
+    last() { return this; },
+    waitFor: async () => await neverVisible,
+    isVisible: async () => false,
+  };
+  const selectModelAndEffort = (ChatGptBrowserWorker.prototype as unknown as {
+    selectModelAndEffort(
+      page: unknown,
+      modelId: string,
+      reasoning: string,
+      capabilities: { localToolsEnabled: boolean; solAvailable: boolean; proAvailable: boolean },
+    ): Promise<unknown>;
+  }).selectModelAndEffort;
+
+  const selection = selectModelAndEffort.call({
+    activeComposer: async () => composer,
+  }, {
+    locator: (selector: string) => selector.includes('[role="alert"]') ? sessionAlert : hiddenDialog,
+  }, "gpt-5.6-sol", "high", {
+    localToolsEnabled: true,
+    solAvailable: true,
+    proAvailable: true,
+  });
+  const result = await Promise.race([
+    selection.catch(error => error),
+    new Promise(resolve => setTimeout(() => resolve("still waiting"), 100)),
+  ]);
+
+  expect(result).toMatchObject({
+    name: "ChatGptWebAdapterError",
+    code: "chatgpt_session_expired",
   });
 });
 

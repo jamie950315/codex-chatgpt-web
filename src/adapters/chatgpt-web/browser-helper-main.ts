@@ -16,6 +16,8 @@ interface RunMessage {
     browserDiagnosticsPath?: string;
     turnTimeoutMs: number;
     autoApproveToolCalls: boolean;
+    rotationSlotId?: string;
+    launcherPartition?: string;
   };
   turn: {
     traceId: string;
@@ -34,6 +36,7 @@ interface VerifyMessage {
   config: {
     appName: string;
     browserHostDescriptorPath: string;
+    surfaceId?: string;
   };
 }
 
@@ -134,6 +137,8 @@ async function run(message: RunMessage): Promise<void> {
       browserDiagnosticsPath: message.config.browserDiagnosticsPath,
       turnTimeoutMs: message.config.turnTimeoutMs,
       autoApproveToolCalls: message.config.autoApproveToolCalls,
+      rotationSlotId: message.config.rotationSlotId,
+      launcherPartition: message.config.launcherPartition,
     },
   };
   const abortController = new AbortController();
@@ -213,7 +218,12 @@ function maintenanceWorker(message: MaintenanceMessage): ChatGptBrowserWorker {
   const provider: CodexProviderConfig = {
     adapter: "chatgpt-web",
     baseUrl: "https://chatgpt.com",
-    chatgptWeb: { appName, browserHost: "launcher", browserHostDescriptorPath },
+    chatgptWeb: {
+      appName,
+      browserHost: "launcher",
+      browserHostDescriptorPath,
+      surfaceId: message.config.surfaceId,
+    },
   };
   return ChatGptBrowserWorker.forProvider(provider);
 }

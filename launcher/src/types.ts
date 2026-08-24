@@ -73,6 +73,29 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+export interface ValidationCheck {
+  status: "ok" | "error" | "warning" | "skipped";
+  message: string;
+  detail?: string;
+}
+
+export interface AccountValidationReport {
+  ok: boolean;
+  accounts: Array<{
+    id: string;
+    name: string;
+    email?: string;
+    tunnel: ValidationCheck;
+    workspaces: Array<{
+      id: string;
+      name: string;
+      chatgptWorkspaceName?: string;
+      login: ValidationCheck;
+      connector?: ValidationCheck;
+    }>;
+  }>;
+}
+
 export interface OperationState {
   name: string;
   status: "running" | "completed" | "failed";
@@ -95,6 +118,23 @@ export interface LauncherSnapshot {
   browser: BrowserState | null;
   connectorName: string;
   mcpCredentialsConfigured: boolean;
+  accounts: {
+    primaryTunnelId: string;
+    accounts: Array<{
+      id: string;
+      name: string;
+      email?: string;
+      credentialId: string;
+      workspaces: Array<{
+        id: string;
+        name: string;
+        chatgptWorkspaceName?: string;
+        signedIn?: boolean;
+        partition: string;
+        credentialId: string;
+      }>;
+    }>;
+  };
   logs: LogRecord[];
   urls: {
     github: string;
@@ -125,7 +165,30 @@ export interface LauncherApi {
   zoomBrowser(action: "in" | "out" | "reset"): Promise<BrowserState>;
   selectBrowserTab(tabId: string): Promise<BrowserState>;
   closeBrowserTab(tabId: string): Promise<BrowserState>;
-  openLogin(): Promise<BrowserState>;
+  openLogin(input?: { partition?: string; slotId?: string; waitForWorkspace?: boolean }): Promise<BrowserState & {
+    identity?: { email?: string; workspaceName?: string };
+    accounts?: LauncherSnapshot["accounts"];
+  }>;
+  addAccount(input: {
+    label: string;
+    reuseCredentialId?: string;
+    sameTunnel?: boolean;
+    tunnelId?: string;
+    runtimeKey?: string;
+  }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  addWorkspace(input: { accountId: string; name?: string }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  renameAccount(input: { id: string; name: string }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  renameWorkspace(input: { id: string; name: string }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  setAccountCredentials(input: {
+    slotIds: string[];
+    sameTunnel?: boolean;
+    tunnelId?: string;
+    runtimeKey?: string;
+  }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  removeAccount(slotId: string): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  removeAccountRecord(input: { id: string }): Promise<{ ok: boolean; stdout: string; accounts: LauncherSnapshot["accounts"] }>;
+  captureIdentities(): Promise<{ accounts: LauncherSnapshot["accounts"] }>;
+  validateAccounts(): Promise<AccountValidationReport>;
   logoutChatGpt(): Promise<{ browser: BrowserState; state: LauncherState }>;
   dismissSessionReminder(): Promise<LauncherState>;
   smokeTest(): Promise<{ ok: boolean; effort: string; response: string }>;

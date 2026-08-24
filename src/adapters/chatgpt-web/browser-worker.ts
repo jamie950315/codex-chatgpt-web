@@ -116,6 +116,85 @@ const settleChatGptUi = (): Promise<void> => (
   new Promise(resolveSettle => setTimeout(resolveSettle, CHATGPT_UI_SETTLE_MS))
 );
 
+interface ConnectorMentionHost {
+  config: { appName: string };
+  activeComposer(page: Page): Promise<Locator>;
+  connectorMentionRowTitles(menuRows: Locator): Promise<string[]>;
+  connectorMentionFailure(menuRows: Locator, triggerAttempts: number): Promise<string>;
+}
+
+async function waitForConnectorMention(
+  host: ConnectorMentionHost,
+  page: Page,
+  captureDiagnostic?: (checkpoint: string) => Promise<void>,
+  catalogRefreshAvailable = false,
+  attemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 },
+): Promise<{ menuRows: Locator; appResult: Locator }> {
+  const menuRows = page.locator('.__menu-item[tabindex="0"]');
+  const appResult = menuRows.filter({
+    has: page.getByText(host.config.appName, { exact: true }),
+  });
+  let firstMenuCaptured = false;
+  while (attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
+    attemptBudget.triggerAttempts += 1;
+    const composer = await host.activeComposer(page);
+    await composer.fill("");
+    await composer.focus();
+    await settleChatGptUi();
+    await composer.pressSequentially("@codex", { delay: 25 });
+    if (!firstMenuCaptured) {
+      firstMenuCaptured = true;
+      await captureDiagnostic?.("connector-mention-triggered");
+    }
+    try {
+      await appResult.waitFor({
+        state: "visible",
+        timeout: 2_500,
+      });
+      await captureDiagnostic?.("connector-menu-visible");
+      break;
+    } catch (error) {
+      if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
+      const visibleRows = await host.connectorMentionRowTitles(menuRows);
+      const knownIdentityMismatch = host.config.appName === CHATGPT_CONNECTOR_NAME
+        && (
+          visibleRows.includes(DEV_CHATGPT_CONNECTOR_NAME)
+          || LEGACY_CHATGPT_CONNECTOR_NAMES.some(name => visibleRows.includes(name))
+        );
+      if (knownIdentityMismatch) {
+        await captureDiagnostic?.("connector-menu-missing");
+        throw chatGptConnectorUnavailableError(
+          await host.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts),
+        );
+      }
+      if (
+        catalogRefreshAvailable
+        && visibleRows.length > 0
+        && !visibleRows.includes(host.config.appName)
+        && attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS
+      ) {
+        throw new ChatGptConnectorCatalogStaleError(
+          host.config.appName,
+          attemptBudget.triggerAttempts,
+        );
+      }
+      if (attemptBudget.triggerAttempts >= MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
+        await captureDiagnostic?.("connector-menu-missing");
+        throw chatGptConnectorUnavailableError(
+          await host.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts),
+        );
+      }
+    }
+  }
+  if (await appResult.count() !== 1) {
+    throw chatGptConnectorUnavailableError(
+      `ChatGPT connector menu did not expose one exact ${JSON.stringify(host.config.appName)} row`
+      + ` after ${attemptBudget.triggerAttempts} complete mention trigger attempt(s)`,
+    );
+  }
+  return { menuRows, appResult };
+}
+
 class ChatGptConnectorCatalogStaleError extends Error {
   constructor(
     readonly appName: string,
@@ -152,15 +231,15 @@ export class ChatGptPromptAttachmentIntegrityError extends ChatGptWebAdapterErro
 }
 
 const chatGptRateLimitDialog = (page: Page): Locator => page.locator('[role="dialog"]')
-  .filter({ hasText: /Too many requests/i })
-  .filter({ hasText: /making requests too quickly/i })
+  .filter({ hasText: /Too many requests|太多要求|太多请求/i })
+  .filter({ hasText: /making requests too quickly|過於頻繁|过于频繁/i })
   .last();
 
 export async function throwIfChatGptRateLimitDialog(page: Page): Promise<void> {
   const dialog = chatGptRateLimitDialog(page);
   if (!await dialog.isVisible().catch(() => false)) return;
 
-  const acknowledge = dialog.getByRole("button", { name: "Got it", exact: true }).last();
+  const acknowledge = dialog.getByRole("button", { name: /^(Got it|知道了)$/ }).last();
   if (await acknowledge.isVisible().catch(() => false)) {
     try {
       await acknowledge.press("Enter");
@@ -198,13 +277,29 @@ export async function dismissChatGptTemporaryChatOnboarding(page: Page): Promise
 
 type ChatGptTextScope = Pick<Locator, "getByText">;
 
-const chatGptSessionFailureAlert = (page: Page): Locator => page
+const chatGptSubscriptionFailureAlert = (page: Page): Locator => page
   .locator('[role="alert"]')
   .filter({ hasText: /Failed to load subscription/i })
   .last();
 
+const chatGptExpiredSessionAlert = (page: Page): Locator => page
+  .locator('[role="alert"], [role="dialog"]')
+  .filter({ hasText: /Your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i })
+  .last();
+
+const chatGptSessionFailureAlert = (page: Page): Locator => page
+  .locator('[role="alert"], [role="dialog"]')
+  .filter({ hasText: /Failed to load subscription|Your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i })
+  .last();
+
 export async function throwIfChatGptSessionFailureAlert(page: Page): Promise<void> {
-  if (!await chatGptSessionFailureAlert(page).isVisible().catch(() => false)) return;
+  if (await chatGptExpiredSessionAlert(page).isVisible().catch(() => false)) {
+    throw new ChatGptWebAdapterError(
+      "The ChatGPT session has expired. Sign in to this account workspace again in Codex Web GPT.",
+      { status: 401, errorType: "authentication_error", code: "chatgpt_session_expired", retryable: true },
+    );
+  }
+  if (!await chatGptSubscriptionFailureAlert(page).isVisible().catch(() => false)) return;
   throw new ChatGptWebAdapterError(
     "ChatGPT could not load the account subscription. Reload ChatGPT inside the launcher and retry; sign out only if the error persists.",
     { status: 503, errorType: "server_error", code: "chatgpt_subscription_unavailable", retryable: true },
@@ -483,6 +578,9 @@ export interface ResolvedBrowserConfig {
   turnTimeoutMs?: number;
   headed: boolean;
   autoApproveToolCalls: boolean;
+  rotationSlotId?: string;
+  launcherPartition?: string;
+  surfaceId?: string;
 }
 
 export function chatGptTurnIsComplete(state: {
@@ -917,6 +1015,9 @@ export function resolveBrowserConfig(provider: CodexProviderConfig): ResolvedBro
     ...(turnTimeoutMs !== undefined ? { turnTimeoutMs } : {}),
     headed: configured.headed !== false,
     autoApproveToolCalls: configured.autoApproveToolCalls === true,
+    ...(configured.rotationSlotId ? { rotationSlotId: configured.rotationSlotId } : {}),
+    ...(configured.launcherPartition ? { launcherPartition: configured.launcherPartition } : {}),
+    ...(configured.surfaceId ? { surfaceId: configured.surfaceId } : {}),
   };
 }
 
@@ -975,7 +1076,7 @@ export class ChatGptBrowserWorker {
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
 
-  private constructor(private readonly config: ResolvedBrowserConfig) {}
+  private constructor(readonly config: ResolvedBrowserConfig) {}
 
   /**
    * Lexical/contenteditable may preserve runs of ASCII spaces by exposing some of them as NBSP
@@ -1129,7 +1230,11 @@ export class ChatGptBrowserWorker {
   private async ensurePage(): Promise<Page> {
     if (this.page && !this.page.isClosed()) return this.page;
     if (this.config.browserHost === "launcher") {
-      const connection = await connectLauncherBrowserHost(this.config.browserHostDescriptorPath!);
+      const connection = await connectLauncherBrowserHost(
+        this.config.browserHostDescriptorPath!,
+        20_000,
+        this.config.surfaceId,
+      );
       this.browser = connection.browser;
       this.context = connection.context;
       this.page = connection.page;
@@ -1214,10 +1319,22 @@ export class ChatGptBrowserWorker {
       return mode;
     }
     const currentEffort = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR).last();
+    const effortWaitAbort = new AbortController();
     try {
-      await currentEffort.waitFor({ state: "visible", timeout: 70_000 });
-    } catch {
+      const ready = await Promise.race([
+        currentEffort.waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "effort" as const),
+        chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "rate-limit" as const),
+        chatGptSessionFailureAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: effortWaitAbort.signal }).then(() => "session-failure" as const),
+      ]);
+      if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
+      if (ready === "session-failure") await throwIfChatGptSessionFailureAlert(page);
+    } catch (error) {
+      if (error instanceof ChatGptWebAdapterError) throw error;
+      await throwIfChatGptRateLimitDialog(page);
+      await throwIfChatGptSessionFailureAlert(page);
       throw new Error("ChatGPT rendered the composer but its model/effort control did not become ready");
+    } finally {
+      effortWaitAbort.abort();
     }
     await settleChatGptUi();
     await throwIfChatGptRateLimitDialog(page);
@@ -1237,18 +1354,21 @@ export class ChatGptBrowserWorker {
     const effortChoice = effortChoices.nth(uiEffortIndex);
     const effortSlider = page.locator(CHATGPT_EFFORT_SLIDER_SELECTOR).filter({ visible: true }).last();
     const waitAbort = new AbortController();
-    let ready: "effort" | "slider" | "rate-limit";
+    let ready: "effort" | "slider" | "rate-limit" | "session-failure";
     try {
       ready = await Promise.race([
         effortChoice.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "effort" as const),
         effortSlider.waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "slider" as const),
         chatGptRateLimitDialog(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "rate-limit" as const),
+        chatGptSessionFailureAlert(page).waitFor({ state: "visible", timeout: 70_000, signal: waitAbort.signal }).then(() => "session-failure" as const),
       ]);
       if (ready === "rate-limit") await throwIfChatGptRateLimitDialog(page);
+      if (ready === "session-failure") await throwIfChatGptSessionFailureAlert(page);
       await captureDiagnostic?.(ready === "slider" ? "effort-slider-visible" : "effort-choice-visible");
     } catch (error) {
       if (error instanceof ChatGptWebAdapterError) throw error;
       await throwIfChatGptRateLimitDialog(page);
+      await throwIfChatGptSessionFailureAlert(page);
       throw new ChatGptWebAdapterError(
         `ChatGPT effort menu did not expose item index ${uiEffortIndex}`
         + `; item count: ${await effortChoices.count().catch(() => 0)}`,
@@ -1577,75 +1697,25 @@ export class ChatGptBrowserWorker {
     catalogRefreshAvailable = false,
     attemptBudget: ChatGptConnectorAttemptBudget = { triggerAttempts: 0 },
   ): Promise<Locator> {
-    let composer = await this.activeComposer(page);
+    const composer = await this.activeComposer(page);
     await composer.fill("");
     if (await this.connectorIsSelected(composer)) {
       await captureDiagnostic?.("connector-already-selected");
       return composer;
     }
 
-    const menuRows = page.locator('.__menu-item[tabindex="0"]');
-    const appResult = menuRows.filter({
-      has: page.getByText(this.config.appName, { exact: true }),
-    });
-    let firstMenuCaptured = false;
-    while (attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
-      attemptBudget.triggerAttempts += 1;
-      composer = await this.activeComposer(page);
-      await composer.fill("");
-      await composer.focus();
-      await settleChatGptUi();
-      await composer.pressSequentially("@codex", { delay: 25 });
-      if (!firstMenuCaptured) {
-        firstMenuCaptured = true;
-        await captureDiagnostic?.("connector-mention-triggered");
-      }
-      try {
-        await appResult.waitFor({
-          state: "visible",
-          timeout: 2_500,
-        });
-        await captureDiagnostic?.("connector-menu-visible");
-        break;
-      } catch (error) {
-        if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
-        const visibleRows = await this.connectorMentionRowTitles(menuRows);
-        const knownIdentityMismatch = this.config.appName === CHATGPT_CONNECTOR_NAME
-          && (
-            visibleRows.includes(DEV_CHATGPT_CONNECTOR_NAME)
-            || LEGACY_CHATGPT_CONNECTOR_NAMES.some(name => visibleRows.includes(name))
-          );
-        if (knownIdentityMismatch) {
-          await captureDiagnostic?.("connector-menu-missing");
-          throw chatGptConnectorUnavailableError(
-            await this.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts),
-          );
-        }
-        if (
-          catalogRefreshAvailable
-          && visibleRows.length > 0
-          && !visibleRows.includes(this.config.appName)
-          && attemptBudget.triggerAttempts < MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS
-        ) {
-          throw new ChatGptConnectorCatalogStaleError(
-            this.config.appName,
-            attemptBudget.triggerAttempts,
-          );
-        }
-        if (attemptBudget.triggerAttempts >= MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS) {
-          await captureDiagnostic?.("connector-menu-missing");
-          throw chatGptConnectorUnavailableError(
-            await this.connectorMentionFailure(menuRows, attemptBudget.triggerAttempts),
-          );
-        }
-      }
-    }
-    if (await appResult.count() !== 1) {
-      throw chatGptConnectorUnavailableError(
-        `ChatGPT connector menu did not expose one exact ${JSON.stringify(this.config.appName)} row`
-        + ` after ${attemptBudget.triggerAttempts} complete mention trigger attempt(s)`,
-      );
-    }
+    const { menuRows, appResult } = await waitForConnectorMention(
+      {
+        config: this.config,
+        activeComposer: page => this.activeComposer(page),
+        connectorMentionRowTitles: menuRows => this.connectorMentionRowTitles(menuRows),
+        connectorMentionFailure: (menuRows, attempts) => this.connectorMentionFailure(menuRows, attempts),
+      },
+      page,
+      captureDiagnostic,
+      catalogRefreshAvailable,
+      attemptBudget,
+    );
     // Hidden launcher maintenance keeps a 1x1 Chromium viewport, so pointer activation cannot
     // reach this menu. Unlike the old unguarded composer Enter path, require the exact row to own
     // ChatGPT's keyboard highlight first; otherwise move the menu highlight until it does. Keep
@@ -1668,7 +1738,16 @@ export class ChatGptBrowserWorker {
     // detached/hidden editor even though verification just succeeded.
     const selectedComposer = await this.activeComposer(page);
     const selectedConnector = this.selectedConnectorControl(selectedComposer);
-    await selectedConnector.waitFor({ state: "visible", timeout: 10_000 });
+    try {
+      await selectedConnector.waitFor({ state: "visible", timeout: 10_000 });
+    } catch (error) {
+      const keywords = await selectedComposer
+        .locator('[data-id^="plugin:"][data-keyword]')
+        .evaluateAll(elements => elements.map(element => element.getAttribute("data-keyword")));
+      if (keywords.filter(keyword => keyword === this.config.appName).length !== 1) throw error;
+      await captureDiagnostic?.("connector-selected");
+      return selectedComposer;
+    }
     if (!await this.connectorIsSelected(selectedComposer)) {
       throw new Error(`ChatGPT composer did not select ${JSON.stringify(this.config.appName)} connector`);
     }
@@ -1894,10 +1973,18 @@ export class ChatGptBrowserWorker {
   private async verifyConnectorExclusive(): Promise<string> {
     const page = await this.ensurePage();
     await this.prepareTemporaryChatSurface(page);
-    // The launcher refreshes its owned ChatGPT document before starting this helper. A second
-    // reload here can discard the first catalog's exact mismatch evidence and report a generic
-    // menu failure instead of identifying the connector the account actually exposes.
-    await this.selectConnector(page);
+    // Account/workspace validation only needs the connector to appear in this ChatGPT
+    // workspace's @ mention catalog. Forcing the selected pill is what real turns do; extra
+    // Electron partitions often open the catalog and then fail to attach the chip.
+    const composer = await this.activeComposer(page);
+    await composer.fill("");
+    if (await this.connectorIsSelected(composer)) return this.config.appName;
+    await waitForConnectorMention({
+      config: this.config,
+      activeComposer: candidate => this.activeComposer(candidate),
+      connectorMentionRowTitles: menuRows => this.connectorMentionRowTitles(menuRows),
+      connectorMentionFailure: (menuRows, attempts) => this.connectorMentionFailure(menuRows, attempts),
+    }, page);
     return this.config.appName;
   }
 
@@ -2246,6 +2333,7 @@ export class ChatGptBrowserWorker {
       phase: "start",
       traceId: turn.traceId,
       helperPid: process.pid,
+      ...(this.config.launcherPartition ? { partition: this.config.launcherPartition } : {}),
     }).catch(error => {
       if (error instanceof LauncherBrowserTurnCancelledError) throw chatGptBrowserTabClosedError();
       throw error;

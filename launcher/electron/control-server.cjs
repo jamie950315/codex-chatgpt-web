@@ -115,7 +115,15 @@ class BrowserControlServer {
       }
       const preferences = this.getPreferences();
       if (request.url === "/v1/turn/start") {
-        const lease = host.beginTurn(body.traceId, preferences.showBrowserDuringTurns === true, body.helperPid);
+        const partition = typeof body.partition === "string" && body.partition.startsWith("persist:codex-web-gpt-")
+          ? body.partition
+          : undefined;
+        const lease = host.beginTurn(
+          body.traceId,
+          preferences.showBrowserDuringTurns === true,
+          body.helperPid,
+          partition,
+        );
         this.logger.info("browser.turn_started", { traceId: body.traceId });
         writeJson(response, 200, { ok: true, ...lease });
         return;

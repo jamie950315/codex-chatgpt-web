@@ -2,10 +2,11 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { buildResponseJSON } from "../src/bridge";
+import { launcherPartitionForSlot, loadRotationState, type AccountRotationConfig } from "../src/account-rotation";
 import { ChatGptWebAdapterError } from "../src/adapters/chatgpt-web/adapter-error";
 import { ChatGptCompletionTracker, chatGptImageFilePayloads, chatGptPromptFilePayloads, chatGptTurnIsComplete } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptBrowserWorker, type BrowserTurn } from "../src/adapters/chatgpt-web/browser-worker";
@@ -17,7 +18,7 @@ import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt, withoutSupersed
 import { MAX_CHATGPT_WEB_TURN_RETRIES } from "../src/adapters/chatgpt-web/retry-policy";
 import { ChatGptTextFeed, ChatGptTraceFeed, ChatGptTurnSessions, chatGptCompactionSourceExecutionKey, chatGptTurnExecutionKey, chatGptTurnSessions } from "../src/adapters/chatgpt-web/turn-execution";
 import { callTurnBroker, TurnBroker, type BrokerToolResult } from "../src/adapters/chatgpt-web/turn-broker";
-import { defaultBrokerEndpoint } from "../src/config";
+import { defaultBrokerEndpoint, defaultConfig, loadConfig, saveConfig } from "../src/config";
 import { estimateChatGptWebUsage } from "../src/adapters/chatgpt-web/usage";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 import { parseRequest } from "../src/responses/parser";
@@ -123,6 +124,84 @@ function rawWireRequest(environmentText: string): CodexParsedRequest {
   return request;
 }
 
+function withTurnIdentity(request: CodexParsedRequest, turnId: string): CodexParsedRequest {
+  const next = structuredClone(request);
+  const raw = next._rawBody as {
+    client_metadata: Record<string, unknown>;
+    input: Array<Record<string, unknown>>;
+  };
+  raw.client_metadata["x-codex-turn-metadata"] = JSON.stringify({
+    thread_id: "thread_test_123",
+    turn_id: turnId,
+  });
+  for (const item of raw.input) {
+    if (item.internal_chat_message_metadata_passthrough) {
+      item.internal_chat_message_metadata_passthrough = { turn_id: turnId };
+    }
+  }
+  return next;
+}
+
+function testAccountRotation(root: string): AccountRotationConfig {
+  return {
+    accounts: [
+      { id: "account_a", name: "Account A", credentialId: "credential_a" },
+      { id: "account_b", name: "Account B", credentialId: "credential_b" },
+    ],
+    credentials: [
+      {
+        id: "credential_a",
+        tunnelId: `tunnel_${"a".repeat(32)}`,
+        runtimeKeyFile: join(root, "a.key"),
+        alias: "account-a",
+        profileName: "account-a",
+      },
+      {
+        id: "credential_b",
+        tunnelId: `tunnel_${"b".repeat(32)}`,
+        runtimeKeyFile: join(root, "b.key"),
+        alias: "account-b",
+        profileName: "account-b",
+      },
+    ],
+    slots: [
+      {
+        id: "slot_a",
+        accountId: "account_a",
+        label: "Slot A",
+        signedIn: true,
+        storageStatePath: join(root, "slot-a.json"),
+        credentialId: "credential_a",
+      },
+      {
+        id: "slot_b",
+        accountId: "account_b",
+        label: "Slot B",
+        signedIn: true,
+        storageStatePath: join(root, "slot-b.json"),
+        credentialId: "credential_b",
+      },
+    ],
+  };
+}
+
+function providerForRotationSlot(
+  provider: CodexProviderConfig,
+  rotation: AccountRotationConfig,
+  slotId: string,
+): CodexProviderConfig {
+  const slot = rotation.slots.find(candidate => candidate.id === slotId)!;
+  return {
+    ...provider,
+    chatgptWeb: {
+      ...provider.chatgptWeb,
+      storageStatePath: slot.storageStatePath,
+      rotationSlotId: slot.id,
+      launcherPartition: launcherPartitionForSlot(slot.id),
+    },
+  };
+}
+
 function canonicalCurrentWireRequest(environmentText: string): CodexParsedRequest {
   const request = rawWireRequest(environmentText);
   const raw = request._rawBody as {
@@ -216,6 +295,396 @@ describe("ChatGPT outer-native harness v4", () => {
 
     expect(() => extractChatGptTurnEnvironment(request)).toThrow("missing cwd");
     expect(() => chatGptTurnExecutionKey(request)).toThrow("conflicts with native Codex turn_id");
+  });
+
+  test("account rotation claims once for repeated provider rounds and advances only for a new execution key", async () => {
+    const root = join(tempRoot, `rotation-session-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const rotation = testAccountRotation(root);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-session-${Date.now()}`,
+      chatgptWeb: { accountRotation: rotation, localToolsEnabled: false, solAvailable: true, proAvailable: true },
+    };
+    const starts: string[] = [];
+    const workers = rotation.slots.map(slot => {
+      const worker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(provider, rotation, slot.id));
+      const originalRun = worker.run.bind(worker);
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+        starts.push(slot.id);
+        const answer = `answer from ${slot.id}`;
+        turn.onTextDelta(answer);
+        return answer;
+      };
+      return { worker, originalRun };
+    });
+    const first = withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_a");
+    const second = withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_b");
+    try {
+      for (const request of [first, first, second]) {
+        const events: AdapterEvent[] = [];
+        await createChatGptWebAdapter(provider).runTurn!(
+          request,
+          { headers: new Headers() },
+          event => events.push(event),
+        );
+        expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      }
+      expect(starts).toEqual(["slot_a", "slot_b"]);
+      expect(loadRotationState(root).nextIndex).toBe(0);
+    } finally {
+      for (const { worker, originalRun } of workers) {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+      chatGptTurnSessions.clear();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
+  });
+
+  test("a new turn uses the latest signed-in workspace state instead of the server startup snapshot", async () => {
+    const root = join(tempRoot, `rotation-live-config-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const startupRotation = testAccountRotation(root);
+    const currentConfig = defaultConfig("browser-only");
+    currentConfig.accountRotation = {
+      ...startupRotation,
+      slots: startupRotation.slots.map(slot => (
+        slot.id === "slot_a" ? { ...slot, signedIn: false } : slot
+      )),
+    };
+    saveConfig(currentConfig);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-live-config-${Date.now()}`,
+      chatgptWeb: {
+        accountRotation: startupRotation,
+        accountRotationConfigPath: join(root, "config.json"),
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const starts: string[] = [];
+    const workers = startupRotation.slots.map(slot => {
+      const worker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(provider, startupRotation, slot.id));
+      const originalRun = worker.run.bind(worker);
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+        starts.push(slot.id);
+        const answer = `answer from ${slot.id}`;
+        turn.onTextDelta(answer);
+        return answer;
+      };
+      return { worker, originalRun };
+    });
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_live_config"),
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(starts).toEqual(["slot_b"]);
+    } finally {
+      for (const { worker, originalRun } of workers) {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+      chatGptTurnSessions.clear();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
+  });
+
+  test("a running server notices rotation enabled after its provider startup snapshot", async () => {
+    const root = join(tempRoot, `rotation-enabled-live-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const rotation = testAccountRotation(root);
+    const storedConfig = defaultConfig("browser-only");
+    storedConfig.accountRotation = rotation;
+    saveConfig(storedConfig);
+    const startupProvider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-enabled-live-${Date.now()}`,
+      chatgptWeb: {
+        accountRotationConfigPath: join(root, "config.json"),
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const starts: string[] = [];
+    const defaultWorker = ChatGptBrowserWorker.forProvider(startupProvider);
+    const slotWorker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(startupProvider, rotation, "slot_a"));
+    const originalDefaultRun = defaultWorker.run.bind(defaultWorker);
+    const originalSlotRun = slotWorker.run.bind(slotWorker);
+    (defaultWorker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      starts.push("startup-primary");
+      turn.onTextDelta("startup answer");
+      return "startup answer";
+    };
+    (slotWorker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+      starts.push("slot_a");
+      turn.onTextDelta("rotated answer");
+      return "rotated answer";
+    };
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(startupProvider).runTurn!(
+        withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_enabled_live"),
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(starts).toEqual(["slot_a"]);
+    } finally {
+      (defaultWorker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalDefaultRun;
+      (slotWorker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalSlotRun;
+      chatGptTurnSessions.clear();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
+  });
+
+  test("automatic retries keep one account claim for the native Codex turn", async () => {
+    const root = join(tempRoot, `rotation-stable-retry-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const rotation = testAccountRotation(root);
+    const storedConfig = defaultConfig("browser-only");
+    storedConfig.accountRotation = rotation;
+    saveConfig(storedConfig);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-stable-retry-${Date.now()}`,
+      chatgptWeb: {
+        accountRotation: rotation,
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const starts: string[] = [];
+    let firstSlotAttempts = 0;
+    const workers = rotation.slots.map(slot => {
+      const worker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(provider, rotation, slot.id));
+      const originalRun = worker.run.bind(worker);
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+        starts.push(slot.id);
+        if (slot.id === "slot_a" && firstSlotAttempts++ === 0) {
+          throw new ChatGptWebAdapterError("temporary ChatGPT failure", {
+            status: 503,
+            errorType: "server_error",
+            code: "chatgpt_unavailable",
+            retryable: true,
+          });
+        }
+        const answer = `answer from ${slot.id}`;
+        turn.onTextDelta(answer);
+        return answer;
+      };
+      return { worker, originalRun };
+    });
+    const request = withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_stable_retry");
+    try {
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      expect(firstEvents.at(-1)).toMatchObject({ type: "error", code: "chatgpt_unavailable", retryable: true });
+
+      const retryEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => retryEvents.push(event),
+      );
+      expect(retryEvents.at(-1)).toMatchObject({ type: "done", stopReason: "stop", endTurn: true });
+      expect(starts).toEqual(["slot_a", "slot_a"]);
+    } finally {
+      for (const { worker, originalRun } of workers) {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+      chatGptTurnSessions.clear();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
+  });
+
+  test("rotation state write failure does not replace the original ChatGPT error", async () => {
+    if (process.platform === "win32") return;
+    const root = join(tempRoot, `rotation-state-failure-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const rotation = testAccountRotation(root);
+    const storedConfig = defaultConfig("browser-only");
+    storedConfig.accountRotation = rotation;
+    saveConfig(storedConfig);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-state-failure-${Date.now()}`,
+      chatgptWeb: {
+        accountRotation: rotation,
+        localToolsEnabled: false,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    const worker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(provider, rotation, "slot_a"));
+    const originalRun = worker.run.bind(worker);
+    (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async () => {
+      chmodSync(join(root, "runtime"), 0o500);
+      throw new ChatGptWebAdapterError("ChatGPT session expired", {
+        status: 401,
+        errorType: "authentication_error",
+        code: "chatgpt_session_expired",
+        retryable: true,
+      });
+    };
+    try {
+      const events: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_state_failure"),
+        { headers: new Headers() },
+        event => events.push(event),
+      );
+      expect(events.at(-1)).toMatchObject({
+        type: "error",
+        code: "chatgpt_session_expired",
+        message: "ChatGPT session expired",
+      });
+    } finally {
+      chmodSync(join(root, "runtime"), 0o700);
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      chatGptTurnSessions.clear();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
+  });
+
+  test.each([
+    { code: "rate_limit_exceeded", status: 429, errorType: "rate_limit_error" },
+    { code: "chatgpt_session_expired", status: 401, errorType: "authentication_error" },
+  ])("a later provider round cools the rotation slot for $code", async failure => {
+    const root = join(tempRoot, `rotation-cooldown-${failure.code}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const previousHome = process.env.CODEX_CHATGPT_WEB_HOME;
+    process.env.CODEX_CHATGPT_WEB_HOME = root;
+    const socketPath = brokerTestEndpoint(`cgw-rotation-cooldown-${process.pid}-${Date.now()}`);
+    const rotation = testAccountRotation(root);
+    const storedConfig = defaultConfig("browser-only");
+    storedConfig.accountRotation = rotation;
+    saveConfig(storedConfig);
+    const provider: CodexProviderConfig = {
+      adapter: "chatgpt-web",
+      baseUrl: `browser://rotation-cooldown-${Date.now()}`,
+      chatgptWeb: {
+        accountRotation: rotation,
+        brokerSocketPath: socketPath,
+        localToolsEnabled: true,
+        solAvailable: true,
+        proAvailable: true,
+      },
+    };
+    let browserStarts = 0;
+    const workers = rotation.slots.map(slot => {
+      const worker = ChatGptBrowserWorker.forProvider(providerForRotationSlot(provider, rotation, slot.id));
+      const originalRun = worker.run.bind(worker);
+      (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = async turn => {
+        browserStarts += 1;
+        const prepared = await turn.prepare();
+        const token = prepared.text.match(/turn_token (turn_[A-Za-z0-9_-]+)/)?.[1];
+        if (!token) throw new Error("rotation turn token missing");
+        const claimed = await callTurnBroker<{ bindingId: string }>(socketPath, { method: "claim", token });
+        await callTurnBroker<BrokerToolResult>(socketPath, {
+          method: "invoke",
+          bindingId: claimed.bindingId,
+          wireName: "exec_command",
+          arguments: { cmd: "rotation-evidence" },
+        }, 30_000);
+        throw new ChatGptWebAdapterError(`ChatGPT failure after tool continuation: ${failure.code}`, {
+          status: failure.status,
+          errorType: failure.errorType,
+          code: failure.code,
+          retryable: true,
+        });
+      };
+      return { worker, originalRun };
+    });
+    const request = withTurnIdentity(rawWireRequest(environmentXml), "turn_rotation_cooldown");
+    try {
+      const firstEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        request,
+        { headers: new Headers() },
+        event => firstEvents.push(event),
+      );
+      const call = firstEvents.find(
+        (event): event is Extract<AdapterEvent, { type: "tool_call_start" }> => event.type === "tool_call_start",
+      );
+      expect(call?.name).toBe("exec_command");
+
+      const continuation = structuredClone(request);
+      continuation.context.messages.push(
+        {
+          role: "assistant",
+          content: [{ type: "toolCall", id: call!.id, name: "exec_command", arguments: { cmd: "rotation-evidence" } }],
+          timestamp: 3,
+        },
+        {
+          role: "toolResult",
+          toolCallId: call!.id,
+          toolName: "exec_command",
+          content: JSON.stringify({ output: "slot evidence", exit_code: 0 }),
+          isError: false,
+          timestamp: 4,
+        },
+      );
+      ((continuation._rawBody as { input: unknown[] }).input).push(
+        { type: "function_call", call_id: call!.id, name: "exec_command", arguments: JSON.stringify({ cmd: "rotation-evidence" }) },
+        { type: "function_call_output", call_id: call!.id, output: JSON.stringify({ output: "slot evidence", exit_code: 0 }) },
+      );
+      const finalEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        continuation,
+        { headers: new Headers() },
+        event => finalEvents.push(event),
+      );
+      expect(finalEvents.at(-1)).toMatchObject({ type: "error", code: failure.code });
+      const state = loadRotationState(root);
+      expect(state.cooldowns.slot_a).toBeGreaterThan(Date.now());
+      expect(state.cooldowns.slot_b).toBeUndefined();
+      expect(state.nextIndex).toBe(1);
+      expect(loadConfig().accountRotation?.slots.find(slot => slot.id === "slot_a")?.signedIn)
+        .toBe(failure.code === "chatgpt_session_expired" ? false : true);
+
+      const retryEvents: AdapterEvent[] = [];
+      await createChatGptWebAdapter(provider).runTurn!(
+        continuation,
+        { headers: new Headers() },
+        event => retryEvents.push(event),
+      );
+      expect(retryEvents.at(-1)).toMatchObject({ type: "error", code: failure.code, retryable: false });
+      expect(browserStarts).toBe(1);
+    } finally {
+      for (const { worker, originalRun } of workers) {
+        (worker as unknown as { run: (turn: BrowserTurn) => Promise<string> }).run = originalRun;
+      }
+      chatGptTurnSessions.clear();
+      await TurnBroker.forSocket(socketPath).close();
+      if (previousHome === undefined) delete process.env.CODEX_CHATGPT_WEB_HOME;
+      else process.env.CODEX_CHATGPT_WEB_HOME = previousHome;
+    }
   });
 
   test("starts a tool-capable browser turn across a same-turn developer gap", async () => {

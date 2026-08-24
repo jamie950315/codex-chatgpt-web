@@ -11,8 +11,9 @@ import {
   detectChatGptAccountCapabilities,
 } from "./chatgpt-session";
 import type { ChatGptWebAccountCapabilities } from "./chatgpt-web-models";
+import { CHATGPT_IDENTITY_SCRIPT, type ChatGptIdentity } from "./chatgpt-identity";
 
-export interface BrowserLoginResult {
+export interface BrowserLoginResult extends ChatGptIdentity {
   storageStatePath: string;
   accountSurfaceUrl: string;
   solAvailable: boolean;
@@ -144,6 +145,8 @@ export async function loginToChatGpt(
     }
     await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);
+    const identity = await page.evaluate(CHATGPT_IDENTITY_SCRIPT)
+      .catch(() => ({})) as ChatGptIdentity;
     const state = await context.storageState();
 
     const inspected = await inspectStoredState(config, state);
@@ -154,6 +157,7 @@ export async function loginToChatGpt(
       accountSurfaceUrl: page.url(),
       solAvailable: inspected.solAvailable,
       proAvailable: inspected.proAvailable,
+      ...identity,
     };
   } finally {
     await context.close();

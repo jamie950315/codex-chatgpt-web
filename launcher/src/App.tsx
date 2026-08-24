@@ -11,6 +11,7 @@ import {
 import { copyFor, type Copy } from "./i18n";
 import { Icon, type IconName } from "./icons";
 import type {
+  AccountValidationReport,
   BrowserState,
   DoctorReport,
   Language,
@@ -19,6 +20,7 @@ import type {
   LogRecord,
   OperationState,
   Surface,
+  ValidationCheck,
 } from "./types";
 
 const api = window.codexWebLauncher;
@@ -29,6 +31,25 @@ const MCP_GUIDE_MEDIA = [
   new URL("./assets/mcp-connect-connector.gif", import.meta.url).href,
   new URL("./assets/mcp-connect-connector.gif", import.meta.url).href,
 ] as const;
+
+type AccountSnapshot = LauncherSnapshot["accounts"]["accounts"][number];
+
+export function workspaceHasVerifiedLogin(
+  workspace: Pick<AccountSnapshot["workspaces"][number], "id" | "signedIn">,
+  primaryBrowserAuthenticated: boolean,
+): boolean {
+  return workspace.signedIn === true
+    || (workspace.id === "primary" && primaryBrowserAuthenticated);
+}
+
+export function accountHasVerifiedLogin(
+  account: Pick<AccountSnapshot, "workspaces">,
+  primaryBrowserAuthenticated: boolean,
+): boolean {
+  return account.workspaces.some((workspace) => (
+    workspaceHasVerifiedLogin(workspace, primaryBrowserAuthenticated)
+  ));
+}
 
 export function App() {
   const [snapshot, setSnapshot] = useState<LauncherSnapshot | null>(null);
@@ -597,6 +618,8 @@ function LauncherShell({
             {surface === "activity" ? <ActivitySurface copy={copy} logs={logs} setError={setError} /> : null}
             {surface === "settings" ? (
               <SettingsSurface
+                activateBrowser={activateBrowser}
+                browser={browser}
                 copy={copy}
                 devProfile={devProfile}
                 language={language}
@@ -1266,6 +1289,8 @@ function ActivitySurface({
 }
 
 function SettingsSurface({
+  activateBrowser,
+  browser,
   copy,
   devProfile,
   language,
@@ -1273,6 +1298,8 @@ function SettingsSurface({
   snapshot,
   updateState,
 }: {
+  activateBrowser: (show?: boolean) => Promise<void>;
+  browser: BrowserState | null;
   copy: Copy;
   devProfile: boolean;
   language: Language;
@@ -1284,6 +1311,43 @@ function SettingsSurface({
   const [busy, setBusy] = useState(false);
   const [turnsCancelled, setTurnsCancelled] = useState(false);
   const [integrationRemoved, setIntegrationRemoved] = useState(false);
+  const [accounts, setAccounts] = useState(snapshot.accounts || { accounts: [], primaryTunnelId: "" });
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [addingWorkspaceFor, setAddingWorkspaceFor] = useState<string | null>(null);
+  const [accountName, setAccountName] = useState("");
+  const [accountTunnelId, setAccountTunnelId] = useState("");
+  const [accountRuntimeKey, setAccountRuntimeKey] = useState("");
+  const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
+  const [validation, setValidation] = useState<AccountValidationReport | null>(null);
+  const [validating, setValidating] = useState(false);
+  const accountsBusy = busy;
+
+  useEffect(() => {
+    let cancelled = false;
+    void api!.snapshot().then((next) => {
+      if (cancelled) return;
+      if (next.accounts) setAccounts(next.accounts);
+    }).catch((cause) => {
+      if (!cancelled) setError(messageOf(cause));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [setError]);
+
+  const loginSlot = async (workspace: {
+    id: string;
+    partition: string;
+  }, waitForWorkspace = false) => {
+    setError(null);
+    await activateBrowser(true);
+    const login = await api!.openLogin({
+      partition: workspace.partition,
+      slotId: workspace.id,
+      waitForWorkspace,
+    });
+    if (login.accounts) setAccounts(login.accounts);
+  };
 
   const updateLanguage = async (next: Language) => {
     try {
@@ -1399,6 +1463,275 @@ function SettingsSurface({
         </SettingRow>
       </div>
 
+      {!devProfile ? <>
+        <SectionHeading label={copy.accounts} spaced />
+        <p className="settings-help">{copy.accountsBody}</p>
+        <div className="account-stack">
+          {(accounts.accounts || []).length === 0 ? (
+            <p className="account-form-hint">{copy.accountsEmpty}</p>
+          ) : null}
+          {(accounts.accounts || []).map((account) => {
+            const workspaces = account.workspaces || [];
+            const accountSignedIn = accountHasVerifiedLogin(account, browser?.authenticated === true);
+            return (
+              <section className="account-card" key={account.id}>
+                <div className="account-header">
+                  <div>
+                    <input
+                      className="account-name"
+                      defaultValue={account.name}
+                      disabled={accountsBusy}
+                      onBlur={(event) => {
+                        const name = event.target.value.trim();
+                        if (!name || name === account.name) return;
+                        setBusy(true);
+                        void api!.renameAccount({ id: account.id, name })
+                          .then((result) => setAccounts(result.accounts))
+                          .catch((cause) => setError(messageOf(cause)))
+                          .finally(() => setBusy(false));
+                      }}
+                    />
+                    {account.email ? <small className="account-meta">{account.email}</small> : null}
+                    <ValidationNote check={validation?.accounts.find((item) => item.id === account.id)?.tunnel} />
+                  </div>
+                  <div className="account-header-actions">
+                    {accountSignedIn && addingWorkspaceFor !== account.id ? (
+                      <button
+                        className="toolbar-text-button"
+                        disabled={accountsBusy}
+                        onClick={() => {
+                          setAddingWorkspaceFor(account.id);
+                          setWorkspaceNameDraft("");
+                        }}
+                        type="button"
+                      >
+                        {copy.addWorkspace}
+                      </button>
+                    ) : null}
+                    <button
+                      className="toolbar-text-button"
+                      disabled={accountsBusy}
+                      onClick={() => {
+                        setBusy(true);
+                        setError(null);
+                        void api!.removeAccountRecord({ id: account.id })
+                          .then((result) => {
+                            setAccounts(result.accounts);
+                            if (addingWorkspaceFor === account.id) {
+                              setAddingWorkspaceFor(null);
+                              setWorkspaceNameDraft("");
+                            }
+                          })
+                          .catch((cause) => setError(messageOf(cause)))
+                          .finally(() => setBusy(false));
+                      }}
+                      type="button"
+                    >
+                      {copy.removeSlot}
+                    </button>
+                  </div>
+                </div>
+                {accountSignedIn && addingWorkspaceFor === account.id ? (
+                  <div className="account-form">
+                    <FieldRow label={copy.workspaceName}>
+                      <input
+                        onChange={(event) => setWorkspaceNameDraft(event.target.value)}
+                        placeholder={copy.workspaceName}
+                        value={workspaceNameDraft}
+                      />
+                    </FieldRow>
+                    <p className="account-form-hint">{copy.addWorkspaceHint}</p>
+                    <div className="account-form-actions">
+                      <PrimaryButton
+                        disabled={accountsBusy || !workspaceNameDraft.trim()}
+                        onClick={() => {
+                          setBusy(true);
+                          setError(null);
+                          void api!.addWorkspace({ accountId: account.id, name: workspaceNameDraft.trim() })
+                            .then(async (result) => {
+                              setAccounts(result.accounts);
+                              setAddingWorkspaceFor(null);
+                              setWorkspaceNameDraft("");
+                              const created = result.accounts.accounts
+                                .find((item) => item.id === account.id)
+                                ?.workspaces
+                                .slice(-1)[0];
+                              if (created) await loginSlot(created, true);
+                            })
+                            .catch((cause) => setError(messageOf(cause)))
+                            .finally(() => setBusy(false));
+                        }}
+                      >
+                        {copy.loginAccount}
+                      </PrimaryButton>
+                      <button
+                        className="text-button"
+                        disabled={accountsBusy}
+                        onClick={() => {
+                          setAddingWorkspaceFor(null);
+                          setWorkspaceNameDraft("");
+                        }}
+                        type="button"
+                      >
+                        {copy.cancel}
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+                {workspaces.map((workspace) => {
+                  const signedIn = workspaceHasVerifiedLogin(workspace, browser?.authenticated === true);
+                  return (
+                    <div className="workspace-row" key={workspace.id}>
+                      <div>
+                        <input
+                          className="workspace-name"
+                          defaultValue={workspace.name}
+                          disabled={accountsBusy}
+                          onBlur={(event) => {
+                            const name = event.target.value.trim();
+                            if (!name || name === workspace.name) return;
+                            setBusy(true);
+                            void api!.renameWorkspace({ id: workspace.id, name })
+                              .then((result) => setAccounts(result.accounts))
+                              .catch((cause) => setError(messageOf(cause)))
+                              .finally(() => setBusy(false));
+                          }}
+                        />
+                        {workspace.chatgptWorkspaceName
+                          ? <small className="account-meta">{workspace.chatgptWorkspaceName}</small>
+                          : null}
+                        <ValidationNote
+                          check={validation?.accounts
+                            .find((item) => item.id === account.id)
+                            ?.workspaces
+                            .find((item) => item.id === workspace.id)
+                            ?.login}
+                        />
+                        <ValidationNote
+                          check={validation?.accounts
+                            .find((item) => item.id === account.id)
+                            ?.workspaces
+                            .find((item) => item.id === workspace.id)
+                            ?.connector}
+                        />
+                      </div>
+                      {!signedIn ? (
+                        <button
+                          className="toolbar-text-button"
+                          disabled={accountsBusy}
+                          onClick={() => {
+                            setBusy(true);
+                            void loginSlot(
+                              workspace,
+                              accountHasVerifiedLogin(account, browser?.authenticated === true),
+                            )
+                              .catch((cause) => setError(messageOf(cause)))
+                              .finally(() => setBusy(false));
+                          }}
+                          type="button"
+                        >
+                          {copy.loginAccount}
+                        </button>
+                      ) : null}
+                      <button
+                        className="toolbar-text-button"
+                        disabled={accountsBusy}
+                        onClick={() => {
+                          setBusy(true);
+                          void api!.removeAccount(workspace.id)
+                            .then((result) => setAccounts(result.accounts))
+                            .catch((cause) => setError(messageOf(cause)))
+                            .finally(() => setBusy(false));
+                        }}
+                        type="button"
+                      >
+                        {copy.removeSlot}
+                      </button>
+                    </div>
+                  );
+                })}
+              </section>
+            );
+          })}
+          {validation ? (
+            <p className={`account-form-hint account-validation is-${validation.ok ? "ok" : "error"}`}>
+              {validation.ok ? copy.validationOk : copy.validationFailed}
+            </p>
+          ) : null}
+          <div className="account-form-actions">
+            <button
+              className="text-button"
+              disabled={accountsBusy || validating || (accounts.accounts || []).length === 0}
+              onClick={() => {
+                setValidating(true);
+                setError(null);
+                void api!.validateAccounts()
+                  .then(setValidation)
+                  .catch((cause) => setError(messageOf(cause)))
+                  .finally(() => setValidating(false));
+              }}
+              type="button"
+            >
+              {validating ? copy.validatingAccounts : copy.validateAccounts}
+            </button>
+          </div>
+          {addingAccount ? (
+            <div className="account-form">
+              <FieldRow label={copy.accountName}>
+                <input onChange={(event) => setAccountName(event.target.value)} value={accountName} />
+              </FieldRow>
+              <FieldRow label={copy.tunnelId}>
+                <input onChange={(event) => setAccountTunnelId(event.target.value)} placeholder="tunnel_…" value={accountTunnelId} />
+              </FieldRow>
+              <FieldRow label={copy.runtimeKey}>
+                <input onChange={(event) => setAccountRuntimeKey(event.target.value)} placeholder="sk-…" type="password" value={accountRuntimeKey} />
+              </FieldRow>
+              <div className="account-form-actions">
+                <PrimaryButton
+                  disabled={accountsBusy || !accountName.trim() || !accountTunnelId.trim() || !accountRuntimeKey.trim()}
+                  onClick={() => {
+                    setBusy(true);
+                    setError(null);
+                    void api!.addAccount({
+                      label: accountName.trim(),
+                      tunnelId: accountTunnelId.trim(),
+                      runtimeKey: accountRuntimeKey,
+                    }).then(async (result) => {
+                      setAccounts(result.accounts);
+                      setAddingAccount(false);
+                      const createdName = accountName.trim();
+                      setAccountName("");
+                      setAccountTunnelId("");
+                      setAccountRuntimeKey("");
+                      const created = result.accounts.accounts.find((item) => item.name === createdName)
+                        || result.accounts.accounts.slice(-1)[0];
+                      const workspace = created?.workspaces[0];
+                      if (workspace) await loginSlot(workspace);
+                    }).catch((cause) => setError(messageOf(cause))).finally(() => setBusy(false));
+                  }}
+                >
+                  {copy.loginAccount}
+                </PrimaryButton>
+                <button
+                  className="text-button"
+                  disabled={accountsBusy}
+                  onClick={() => {
+                    setAddingAccount(false);
+                    setAccountName("");
+                    setAccountTunnelId("");
+                    setAccountRuntimeKey("");
+                  }}
+                  type="button"
+                >
+                  {copy.cancel}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <PrimaryButton disabled={accountsBusy} onClick={() => setAddingAccount(true)}>{copy.addAccount}</PrimaryButton>
+          )}
+        </div>
+      </> : null}
       {!devProfile && snapshot.state.codexRestartRequired ? (
         <NoticeRow icon="alert" tone="warning">
           {copy.restartCodex}
@@ -1543,6 +1876,16 @@ function SettingRow({ body, children, label }: { body: string; children: ReactNo
       </div>
       {children}
     </div>
+  );
+}
+
+function ValidationNote({ check }: { check?: ValidationCheck }) {
+  if (!check) return null;
+  return (
+    <small className={`account-validation is-${check.status}`}>
+      {check.message}
+      {check.detail ? ` — ${check.detail}` : ""}
+    </small>
   );
 }
 

@@ -47,7 +47,7 @@ async function stopChild(child) {
   }
 }
 
-async function runBrowserHelperOperation({ helper, descriptorPath, appName, operation, payload = {}, logger }) {
+async function runBrowserHelperOperation({ helper, descriptorPath, appName, operation, payload = {}, logger, surfaceId }) {
   if (!helper || typeof helper.executable !== "string" || typeof helper.script !== "string") {
     throw new Error("Browser helper verification command is invalid");
   }
@@ -111,7 +111,11 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
           ...payload,
           type: operation,
           id,
-          config: { appName, browserHostDescriptorPath: descriptorPath },
+          config: {
+            appName,
+            browserHostDescriptorPath: descriptorPath,
+            ...(typeof surfaceId === "string" && surfaceId ? { surfaceId } : {}),
+          },
         }).catch(error => finish(error instanceof Error ? error : new Error(String(error))));
         return;
       }

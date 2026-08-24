@@ -181,6 +181,8 @@ export class LauncherBrowserHelperClient {
             browserDiagnosticsPath: this.config.browserDiagnosticsPath,
             turnTimeoutMs: this.config.turnTimeoutMs,
             autoApproveToolCalls: this.config.autoApproveToolCalls,
+            rotationSlotId: this.config.rotationSlotId,
+            launcherPartition: this.config.launcherPartition,
           },
           turn: {
             traceId: turn.traceId,

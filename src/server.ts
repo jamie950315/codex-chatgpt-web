@@ -6,7 +6,7 @@ import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import { chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
-import { providerConfig } from "./config";
+import { getConfigPath, providerConfig } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -180,6 +180,8 @@ export interface ResponseRequestOptions {
   rememberState?: boolean;
   /** Observe the exact production adapter stream when invoking the handler in-process. */
   onAdapterEvent?: (event: AdapterEvent) => void;
+  /** Exact config backing a long-lived server; omitted by isolated in-process harnesses. */
+  liveConfigPath?: string;
 }
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
@@ -322,7 +324,7 @@ export async function responseRequest(
     parsed.context.messages.push({ role: "user", content: COMPACT_PROMPT, timestamp: Date.now() });
   }
 
-  const provider = providerConfig(config);
+  const provider = providerConfig(config, { liveConfigPath: options.liveConfigPath });
   let cancelledError: Error | undefined;
   try {
     cancelledError = chatGptTurnSessions.cancelledError(chatGptWebTraceId(provider, parsed));
@@ -420,6 +422,7 @@ export async function compactRequest(
   req: Request,
   config: AppConfig,
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
+  options: ResponseRequestOptions = {},
 ): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
@@ -482,7 +485,7 @@ export async function compactRequest(
     body: JSON.stringify({ ...raw, stream: false, input: [...input, { type: "compaction_trigger" }] }),
     signal: req.signal,
   });
-  const response = await responseRequest(internal, config, adapterFactory);
+  const response = await responseRequest(internal, config, adapterFactory, options);
   if (!response.ok) return response;
   let body: {
     output?: unknown[];
@@ -676,11 +679,17 @@ export function startServer(
       }
       if (req.method === "POST" && url.pathname === "/v1/responses") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
-        return httpTurns.track(signal => responseRequest(new Request(req, { signal }), config), req.signal);
+        return httpTurns.track(
+          signal => responseRequest(new Request(req, { signal }), config, createChatGptWebAdapter, { liveConfigPath: getConfigPath() }),
+          req.signal,
+        );
       }
       if (req.method === "POST" && url.pathname === "/v1/responses/compact") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
-        return httpTurns.track(signal => compactRequest(new Request(req, { signal }), config), req.signal);
+        return httpTurns.track(
+          signal => compactRequest(new Request(req, { signal }), config, createChatGptWebAdapter, { liveConfigPath: getConfigPath() }),
+          req.signal,
+        );
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");

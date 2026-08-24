@@ -1479,6 +1479,124 @@ code {
 
 /* Settings */
 
+.account-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.account-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--color-border-light);
+}
+
+.account-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: flex-start;
+}
+
+.account-header > div:first-child {
+  min-width: 0;
+  flex: 1 1 140px;
+}
+
+.account-header-actions {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-left: auto;
+}
+
+.account-name,
+.workspace-name {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-primary);
+  font-weight: 600;
+}
+
+.workspace-name {
+  font-weight: 500;
+}
+
+.account-meta {
+  display: block;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+}
+
+.workspace-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-left: 4px;
+  padding-left: 12px;
+  border-left: 1px solid var(--color-border-light);
+}
+
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.account-form .field-row {
+  margin: 0;
+  min-height: 48px;
+  grid-template-columns: 120px minmax(0, 1fr);
+}
+
+.account-form-hint {
+  margin: 4px 0 8px;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+.account-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 8px;
+}
+
+.account-validation {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-sm);
+  line-height: 1.4;
+}
+
+.account-validation.is-ok {
+  color: var(--color-text-secondary);
+}
+
+.account-validation.is-error {
+  color: #f0883e;
+}
+
+.account-validation.is-warning,
+.account-validation.is-skipped {
+  color: var(--color-text-secondary);
+}
+
+.settings-help {
+  margin: 0 0 12px;
+  color: var(--color-text-secondary);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
 .setting-row {
   display: grid;
   min-height: 66px;

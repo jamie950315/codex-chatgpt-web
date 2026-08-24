@@ -120,6 +120,7 @@ interface ChatGptTurnRuntimeBase {
   trace: ChatGptTraceFeed;
   text: ChatGptTextFeed;
   cancel: (reason?: Error) => void;
+  rotationSlotId?: string;
 }
 
 export type ChatGptTurnRuntime =
