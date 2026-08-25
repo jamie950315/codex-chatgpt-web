@@ -261,6 +261,25 @@ test("production doctor parses its structured unhealthy report from exit status 
   assert.deepEqual(runOptions.acceptedExitCodes, [0, 1]);
 });
 
+test("account validation returns its structured report when checks fail", async () => {
+  const fixture = hostFor(null);
+  const report = {
+    ok: false,
+    mode: "full",
+    accounts: [{ id: "account_a", name: "Account A", tunnel: { status: "error" }, workspaces: [] }],
+  };
+  fixture.host.command = () => ({
+    executable: process.execPath,
+    args: ["-e", `process.stdout.write(${JSON.stringify(JSON.stringify(report))}); process.exit(1);`],
+    cwd: process.cwd(),
+  });
+
+  const result = await fixture.host.validateAccounts();
+
+  assert.equal(result.code, 1);
+  assert.deepEqual(JSON.parse(result.stdout), report);
+});
+
 test("production and DEV setup entrypoints reject the opposite launcher profile", async () => {
   await assert.rejects(hostFor(null).host.setupDevCore(), /isolated DEV launcher/);
   await assert.rejects(devHostFor(null).host.setupCore(), /unavailable in the isolated DEV launcher profile/);

@@ -1116,6 +1116,7 @@ class RuntimeHost {
     return this.run("accounts-validate", ["accounts", "validate"], {
       message: "Validating ChatGPT accounts",
       timeoutMs: 30_000,
+      acceptedExitCodes: [0, 1],
     });
   }
 
