@@ -1,12 +1,12 @@
 import { chatGptWebTraceId, createChatGptWebAdapter } from "./adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers, TurnBroker } from "./adapters/chatgpt-web/turn-broker";
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { chatGptTurnSessions } from "./adapters/chatgpt-web/turn-execution";
 import { chatGptBrowserTabClosedError } from "./adapters/chatgpt-web/adapter-error";
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
-import { getConfigPath, providerConfig } from "./config";
+import { getConfigPath, providerConfig, readProviderApiKey } from "./config";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -18,6 +18,7 @@ import {
   type CodexModelContextOverride,
 } from "./codex-integration";
 import {
+  availableChatGptWebModelRoutes,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
   requireChatGptWebModelRoute,
@@ -173,6 +174,92 @@ export class HttpTurnCounter {
   }
 }
 
+function providerApiAuthorizationError(req: Request, config: AppConfig): Response | undefined {
+  if (!config.providerApi?.enabled) return undefined;
+  let apiKey: string;
+  try {
+    apiKey = readProviderApiKey(config);
+  } catch (error) {
+    return formatErrorResponse(503, "server_error", error instanceof Error ? error.message : String(error));
+  }
+  const expected = Buffer.from(`Bearer ${apiKey}`);
+  const actual = Buffer.from(req.headers.get("authorization") ?? "");
+  if (actual.length === expected.length && timingSafeEqual(actual, expected)) return undefined;
+  return formatErrorResponse(401, "authentication_error", "Provider API key is invalid");
+}
+
+function xmlText(value: string): string {
+  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+}
+
+function providerCompatibleRequest(raw: unknown, config: AppConfig): unknown {
+  if (!config.providerApi?.enabled) return raw;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("Provider request body must be a JSON object");
+  }
+  const body = raw as Record<string, unknown>;
+  const clientMetadata = body.client_metadata;
+  if (clientMetadata && typeof clientMetadata === "object" && !Array.isArray(clientMetadata)
+    && (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"] !== undefined) {
+    return raw;
+  }
+  const metadata = body.metadata;
+  const source = metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    ? (metadata as Record<string, unknown>).agtools_source
+    : undefined;
+  if (source !== "codex_model_provider_batch_test") {
+    throw new Error("Provider requests require native Codex turn metadata");
+  }
+  if (Array.isArray(body.tools) ? body.tools.length > 0 : body.tools !== undefined) {
+    throw new Error("Cockpit Provider connection tests cannot use tools");
+  }
+  if (body.previous_response_id !== undefined) {
+    throw new Error("Cockpit Provider connection tests cannot continue a previous response");
+  }
+  const input = body.input;
+  if (!Array.isArray(input) || input.length !== 1) {
+    throw new Error("Cockpit Provider connection tests require one user message");
+  }
+  const prompt = input[0];
+  if (!prompt || typeof prompt !== "object" || Array.isArray(prompt)
+    || (prompt as Record<string, unknown>).role !== "user"
+    || ((prompt as Record<string, unknown>).type ?? "message") !== "message") {
+    throw new Error("Cockpit Provider connection tests require one user message");
+  }
+  const suffix = randomUUID();
+  const threadId = `provider-test-${suffix}`;
+  const turnId = `provider-test-${randomUUID()}`;
+  const cwd = process.cwd();
+  const environment = `<environment_context>\n  <cwd>${xmlText(cwd)}</cwd>\n  <filesystem><workspace_roots><root>${xmlText(cwd)}</root></workspace_roots><permission_profile type="managed"><file_system type="restricted"><entry access="read"><special>:root</special></entry></file_system></permission_profile></filesystem>\n</environment_context>`;
+  const turnMetadata = {
+    thread_id: threadId,
+    turn_id: turnId,
+    request_kind: "turn",
+    sandbox_mode: "read-only",
+    workspaces: { [cwd]: { has_changes: false } },
+  };
+  const provenance = { internal_chat_message_metadata_passthrough: { turn_id: turnId } };
+  return {
+    ...body,
+    tools: [],
+    client_metadata: { "x-codex-turn-metadata": JSON.stringify(turnMetadata) },
+    input: [
+      {
+        type: "message",
+        id: `msg_provider_context_${suffix}`,
+        role: "user",
+        content: [{ type: "input_text", text: environment }],
+        ...provenance,
+      },
+      {
+        ...(prompt as Record<string, unknown>),
+        id: `msg_provider_prompt_${suffix}`,
+        ...provenance,
+      },
+    ],
+  };
+}
+
 type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapter;
 
 export interface ResponseRequestOptions {
@@ -202,6 +289,18 @@ export async function modelsRequest(
   fetchUpstream?: NativeFetch,
   contextOverride?: () => CodexModelContextOverride | undefined,
 ): Promise<Response> {
+  if (config.providerApi?.enabled) {
+    const authorizationError = providerApiAuthorizationError(req, config);
+    if (authorizationError) return authorizationError;
+    return Response.json({
+      object: "list",
+      data: availableChatGptWebModelRoutes(config).map(route => ({
+        id: route.slug,
+        object: "model",
+        owned_by: "chatgpt-web",
+      })),
+    });
+  }
   let upstream: Response;
   try {
     upstream = await forwardNativeCodexRequest(req, "models", fetchUpstream);
@@ -257,6 +356,8 @@ export async function responseRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
+  const authorizationError = providerApiAuthorizationError(req, config);
+  if (authorizationError) return authorizationError;
   const nativeRequest = req.clone();
   let raw: unknown;
   try {
@@ -272,6 +373,9 @@ export async function responseRequest(
     ? (raw as { model?: unknown }).model
     : undefined;
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
+    if (config.providerApi?.enabled) {
+      return formatErrorResponse(400, "invalid_request_error", `Provider model not found: ${requestedModel}`);
+    }
     try {
       return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
     } catch (error) {
@@ -281,6 +385,11 @@ export async function responseRequest(
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { previous_response_id?: unknown }).previous_response_id
     : undefined;
+  try {
+    raw = providerCompatibleRequest(raw, config);
+  } catch (error) {
+    return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
   const expanded = expandPreviousResponseInput(raw);
   let parsed: CodexParsedRequest;
   let route: ChatGptWebModelRoute;
@@ -424,6 +533,8 @@ export async function compactRequest(
   adapterFactory: ChatGptWebAdapterFactory = createChatGptWebAdapter,
   options: ResponseRequestOptions = {},
 ): Promise<Response> {
+  const authorizationError = providerApiAuthorizationError(req, config);
+  if (authorizationError) return authorizationError;
   const nativeRequest = req.clone();
   let raw: Record<string, unknown>;
   try {
@@ -636,6 +747,10 @@ export function startServer(
         setTimeout(shutdown, 0);
         return Response.json({ status: "ok", accepting_turns: false, ...current });
       }
+      if (config.providerApi?.enabled && url.pathname.startsWith("/v1/")) {
+        const authorizationError = providerApiAuthorizationError(req, config);
+        if (authorizationError) return authorizationError;
+      }
       if (req.method === "GET" && url.pathname === "/v1/models") {
         if (draining) {
           return formatErrorResponse(
@@ -692,6 +807,9 @@ export function startServer(
         );
       }
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
+        if (config.providerApi?.enabled) {
+          return formatErrorResponse(404, "invalid_request_error", "Provider API does not expose native search");
+        }
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
           signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),

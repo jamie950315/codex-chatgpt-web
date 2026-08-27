@@ -118,6 +118,7 @@ export interface LauncherSnapshot {
   browser: BrowserState | null;
   connectorName: string;
   mcpCredentialsConfigured: boolean;
+  provider: ProviderStatus;
   accounts: {
     primaryTunnelId: string;
     accounts: Array<{
@@ -149,6 +150,13 @@ export interface LauncherSnapshot {
   smokePassed: boolean;
   operation: OperationState | null;
   update: UpdateState;
+}
+
+export interface ProviderStatus {
+  enabled: boolean;
+  configured: boolean;
+  baseUrl: string;
+  runtimeStatus: string;
 }
 
 export interface LauncherApi {
@@ -198,6 +206,9 @@ export interface LauncherApi {
   setBridgeEnabled(enabled: boolean): Promise<LauncherState>;
   uninstallIntegration(): Promise<{ cancelled: true } | { cancelled: false; state: LauncherState }>;
   setupCore(): Promise<{ ok: boolean; stdout: string; restartRequired: boolean }>;
+  setupProvider(): Promise<ProviderStatus>;
+  copyProviderKey(): Promise<ProviderStatus>;
+  rotateProviderKey(): Promise<ProviderStatus>;
   setupMcp(input: {
     tunnelId?: string;
     runtimeKey?: string;

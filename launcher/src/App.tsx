@@ -1320,6 +1320,7 @@ function SettingsSurface({
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [validation, setValidation] = useState<AccountValidationReport | null>(null);
   const [validating, setValidating] = useState(false);
+  const [provider, setProvider] = useState(snapshot.provider);
   const accountsBusy = busy;
 
   useEffect(() => {
@@ -1415,9 +1416,61 @@ function SettingsSurface({
       setBusy(false);
     }
   };
+  const setupProvider = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setProvider(await api!.setupProvider());
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const copyProviderKey = async () => {
+    setError(null);
+    try {
+      setProvider(await api!.copyProviderKey());
+    } catch (cause) {
+      setError(messageOf(cause));
+    }
+  };
+  const rotateProviderKey = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setProvider(await api!.rotateProviderKey());
+    } catch (cause) {
+      setError(messageOf(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   return (
     <ContentSurface narrow title={devProfile ? copy.devSettingsTitle : copy.settingsTitle}>
+      {!devProfile ? <>
+        <SectionHeading label={copy.providerApi} />
+        <div className="settings-list">
+          <SettingRow body={copy.providerApiBody} label={provider.enabled ? copy.providerEnabled : copy.providerDisabled}>
+            {provider.enabled ? (
+              <div className="account-form-actions">
+                <button className="toolbar-text-button" disabled={busy} onClick={() => void copyProviderKey()} type="button">
+                  {copy.copyApiKey}
+                </button>
+                <button className="toolbar-text-button" disabled={busy} onClick={() => void rotateProviderKey()} type="button">
+                  {copy.rotateApiKey}
+                </button>
+              </div>
+            ) : (
+              <button className="toolbar-text-button" disabled={busy} onClick={() => void setupProvider()} type="button">
+                {copy.enableProvider}
+              </button>
+            )}
+          </SettingRow>
+        </div>
+        <p className="settings-help"><code>{provider.baseUrl}</code> · {copy.providerRuntime}: {provider.runtimeStatus}</p>
+      </> : null}
       <SectionHeading label={copy.general} />
       <div className="settings-list">
         {!devProfile ? <SettingRow body={copy.launchAtLoginBody} label={copy.launchAtLogin}>
@@ -1428,7 +1481,7 @@ function SettingsSurface({
               .catch((cause) => setError(messageOf(cause)))}
           />
         </SettingRow> : null}
-        {!devProfile ? <SettingRow body={copy.bridgeRouteBody} label={copy.bridgeRoute}>
+        {!devProfile && !provider.enabled ? <SettingRow body={copy.bridgeRouteBody} label={copy.bridgeRoute}>
           <Switch
             checked={snapshot.state.bridgeEnabled}
             disabled={busy || snapshot.state.coreSetupComplete !== true}

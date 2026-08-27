@@ -90,6 +90,98 @@ test("core setup starts in browser-only mode when no installation exists", async
   assert.equal(fixture.invocation().args.includes("--chrome"), false);
 });
 
+test("core setup preserves Provider mode without taking over the Codex route", async () => {
+  const fixture = hostFor({
+    mode: "full",
+    appName: "Codex Native2",
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+  });
+  await fixture.host.setupCore();
+  assert.equal(fixture.invocation().args.includes("--provider-mode"), true);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+});
+
+test("Provider setup preserves the current runtime mode and never requests Codex route replacement", async () => {
+  const fixture = hostFor({ mode: "full", appName: "Codex Native2" });
+  const result = await fixture.host.setupProvider();
+  assert.equal(result.mode, "full");
+  assert.deepEqual(fixture.invocation().args, [
+    "setup",
+    "--full",
+    "--browser-host-descriptor",
+    "/runtime/launcher-browser.json",
+    "--refresh-account-capabilities",
+    "--provider-mode",
+    "--acknowledge-unofficial",
+    "--restart-service",
+    "--app-name",
+    "Codex Native2",
+  ]);
+});
+
+test("Provider status exposes only configuration, endpoint, and runtime state", () => {
+  const existing = {
+    mode: "browser-only",
+    host: "127.0.0.1",
+    port: 17841,
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+  };
+  const fixture = hostFor(existing);
+  fixture.host.supervisor.readState = () => ({ status: "ready" });
+  assert.deepEqual(fixture.host.providerStatus(), {
+    enabled: true,
+    configured: true,
+    baseUrl: "http://127.0.0.1:17841/v1",
+    runtimeStatus: "ready",
+  });
+  assert.equal(JSON.stringify(fixture.host.providerStatus()).includes("apiKey"), false);
+});
+
+test("Provider key copy and rotation keep the secret out of ordinary status", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-provider-key-"));
+  const keyFile = path.join(root, "provider-api.key");
+  const original = "cwg_original_provider_key_0123456789abcdefghijk";
+  fs.writeFileSync(keyFile, `${original}\n`, { mode: 0o600 });
+  try {
+    const fixture = hostFor({
+      mode: "browser-only",
+      host: "127.0.0.1",
+      port: 17841,
+      providerApi: { enabled: true, apiKeyFile: keyFile },
+    });
+    assert.equal(fixture.host.readProviderKey(), original);
+    const rotated = fixture.host.rotateProviderKey();
+    assert.match(rotated, /^cwg_[A-Za-z0-9_-]{43}$/);
+    assert.notEqual(rotated, original);
+    assert.equal(fs.readFileSync(keyFile, "utf8").trim(), rotated);
+    if (process.platform !== "win32") assert.equal(fs.statSync(keyFile).mode & 0o777, 0o600);
+    assert.equal(JSON.stringify(fixture.host.providerStatus()).includes(rotated), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Provider setup rollback checkpoint excludes Codex route and catalog files", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-provider-checkpoint-"));
+  try {
+    const fixture = hostFor({ mode: "browser-only" });
+    fixture.host.supervisor.configPath = path.join(root, "app", "config.json");
+    fixture.host.supervisor.coreHome = path.join(root, "app");
+    fixture.host.codexHome = path.join(root, "codex");
+    const paths = fixture.host.captureSetupCheckpoint(
+      fixture.host.runtimeConfigSnapshot(),
+      "provider",
+    ).map(item => item.path);
+    assert.equal(paths.includes(path.join(root, "codex", "config.toml")), false);
+    assert.equal(paths.includes(path.join(root, "codex", "models_cache.json")), false);
+    assert.equal(paths.some(item => item.includes("integration-journal")), false);
+    assert.equal(paths.includes(path.join(root, "app", "config.json")), true);
+    assert.equal(paths.includes(path.join(root, "app", "secrets", "provider-api.key")), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("DEV core setup configures only the isolated harness contract", async () => {
   const fixture = devHostFor(null);
   const result = await fixture.host.setupDevCore();
@@ -147,6 +239,16 @@ test("Bigger Context updates the isolated DEV config without installing a Codex 
       "--standard-context",
     ],
   });
+});
+
+test("Bigger Context preserves Provider mode without taking over the Codex route", async () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+  });
+  await fixture.host.setBiggerContext(true);
+  assert.equal(fixture.invocation().args.includes("--provider-mode"), true);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
 });
 
 test("DEV setup child environment removes launcher-rebound production aliases", async () => {
@@ -280,6 +382,22 @@ test("account validation returns its structured report when checks fail", async 
   assert.deepEqual(JSON.parse(result.stdout), report);
 });
 
+test("launcher can persist an expired workspace as signed out", async () => {
+  const fixture = hostFor(null);
+  let invocation;
+  fixture.host.run = async (name, args) => {
+    invocation = { name, args };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+
+  await fixture.host.updateAccountIdentity({ slotId: "slot_expired", signedIn: false });
+
+  assert.deepEqual(invocation, {
+    name: "accounts-update-identity",
+    args: ["accounts", "update-identity", "slot_expired", "--signed-out"],
+  });
+});
+
 test("production and DEV setup entrypoints reject the opposite launcher profile", async () => {
   await assert.rejects(hostFor(null).host.setupDevCore(), /isolated DEV launcher/);
   await assert.rejects(devHostFor(null).host.setupCore(), /unavailable in the isolated DEV launcher profile/);
@@ -310,6 +428,7 @@ test("launcher update transaction upgrades its owned full runtime with saved con
     updated: true,
     mode: "full",
     bridgeEnabled: true,
+    providerMode: false,
     fromVersion: "1.1.1",
     toVersion: "1.1.3",
     connectorMigrated: false,
@@ -362,6 +481,36 @@ test("launcher update transaction preserves a deliberately disconnected Codex ro
   assert.equal(disabled, 1);
 });
 
+test("launcher update transaction preserves Provider mode without inspecting or changing Codex routing", async () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    browserHost: "launcher",
+    releaseVersion: "1.1.1",
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+  });
+  fixture.host.bridgeStatus = async () => {
+    throw new Error("Provider upgrade must not inspect the Codex route");
+  };
+
+  const result = await fixture.host.upgradeManagedRuntime();
+
+  assert.equal(fixture.invocation().args.includes("--provider-mode"), true);
+  assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
+  assert.equal(result.bridgeEnabled, false);
+  assert.equal(result.providerMode, true);
+});
+
+test("Provider mode rejects attempts to reconnect the managed Codex route", async () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+  });
+  fixture.host.bridgeStatus = async () => {
+    throw new Error("Provider route guard must run before inspecting the managed route");
+  };
+  await assert.rejects(fixture.host.setBridgeEnabled(true), /unavailable while Provider API mode is enabled/);
+});
+
 test("launcher update transaction leaves current and externally owned runtimes unchanged", async () => {
   const current = hostFor({ mode: "browser-only", browserHost: "launcher", releaseVersion: "1.1.3" });
   const currentFull = hostFor({
@@ -408,6 +557,28 @@ test("MCP setup reuses valid private credentials without exposing or rewriting t
     ]);
     assert.equal(fixture.invocation().args.includes("--refresh-account-capabilities"), false);
     assert.equal(fixture.invocation().args.includes("--replace-codex-route"), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("MCP setup preserves Provider mode without taking over the Codex route", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-provider-mcp-"));
+  const keyPath = path.join(root, "tunnel-runtime.key");
+  fs.writeFileSync(keyPath, "saved-private-runtime-key\n", { mode: 0o600 });
+  const fixture = hostFor({
+    mode: "full",
+    appName: "Codex Native2",
+    providerApi: { enabled: true, apiKeyFile: "/runtime/provider-api.key" },
+    tunnel: {
+      tunnelId: "tunnel_0123456789abcdef0123456789abcdef",
+      runtimeKeyFile: keyPath,
+    },
+  });
+  try {
+    await fixture.host.setupMcp();
+    assert.equal(fixture.invocation().args.includes("--provider-mode"), true);
+    assert.equal(fixture.invocation().args.includes("--replace-codex-route"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

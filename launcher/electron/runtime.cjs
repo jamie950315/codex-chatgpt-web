@@ -192,6 +192,65 @@ class RuntimeHost {
     }
   }
 
+  providerModeConfigured() {
+    return this.runtimeConfigSnapshot().config?.providerApi?.enabled === true;
+  }
+
+  providerStatus() {
+    const snapshot = this.runtimeConfigSnapshot();
+    const config = snapshot.config;
+    const enabled = config?.providerApi?.enabled === true;
+    const configured = enabled
+      && typeof config.providerApi.apiKeyFile === "string"
+      && path.isAbsolute(config.providerApi.apiKeyFile);
+    const host = typeof config?.host === "string" && config.host ? config.host : "127.0.0.1";
+    const port = Number.isInteger(config?.port) ? config.port : 17841;
+    let runtimeStatus = "not-configured";
+    try {
+      const state = this.supervisor.readState?.();
+      runtimeStatus = typeof state?.status === "string"
+        ? state.status
+        : snapshot.configured ? "stopped" : "not-configured";
+    } catch {
+      runtimeStatus = snapshot.configured ? "unknown" : "not-configured";
+    }
+    return {
+      enabled,
+      configured,
+      baseUrl: `http://${host}:${port}/v1`,
+      runtimeStatus,
+    };
+  }
+
+  readProviderKey() {
+    const config = this.runtimeConfigSnapshot().config;
+    const keyFile = config?.providerApi?.enabled === true ? config.providerApi.apiKeyFile : "";
+    if (typeof keyFile !== "string" || !path.isAbsolute(keyFile)) {
+      throw new Error("Provider API is not configured");
+    }
+    const stat = fs.statSync(keyFile);
+    if (!stat.isFile()) throw new Error("Provider API key path is not a file");
+    if (this.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+      throw new Error("Provider API key file must be readable only by its owner");
+    }
+    const key = fs.readFileSync(keyFile, "utf8").trim();
+    if (!/^cwg_[A-Za-z0-9_-]{43}$/.test(key)) throw new Error("Provider API key is invalid");
+    return key;
+  }
+
+  rotateProviderKey() {
+    const config = this.runtimeConfigSnapshot().config;
+    const keyFile = config?.providerApi?.enabled === true ? config.providerApi.apiKeyFile : "";
+    if (typeof keyFile !== "string" || !path.isAbsolute(keyFile)) {
+      throw new Error("Provider API is not configured");
+    }
+    this.readProviderKey();
+    const key = `cwg_${randomBytes(32).toString("base64url")}`;
+    writePrivateFileAtomic(keyFile, `${key}\n`);
+    if (this.platform !== "win32") fs.chmodSync(keyFile, 0o600);
+    return key;
+  }
+
   cleanupEphemeralSecrets() {
     const secretsDir = path.join(this.app.getPath("userData"), "secrets");
     try {
@@ -282,7 +341,7 @@ class RuntimeHost {
     );
   }
 
-  captureSetupCheckpoint(snapshot) {
+  captureSetupCheckpoint(snapshot, scope = "managed") {
     if (typeof this.supervisor.configPath !== "string" || !path.isAbsolute(this.supervisor.configPath)) {
       throw new Error("Launcher runtime supervisor has no absolute configuration path for setup rollback");
     }
@@ -290,13 +349,22 @@ class RuntimeHost {
       || path.dirname(this.supervisor.configPath);
     const paths = new Set([
       this.supervisor.configPath,
-      path.join(coreHome, "codex", "integration-journal.json"),
-      path.join(coreHome, "codex", "integration-journal.recovery.json"),
-      path.join(this.codexHome, "config.toml"),
-      path.join(this.codexHome, "models_cache.json"),
       path.join(coreHome, "secrets", "tunnel-runtime.key"),
       path.join(coreHome, "tunnel", "profiles", "codex-chatgpt-web.yaml"),
     ]);
+    if (scope !== "provider") {
+      paths.add(path.join(coreHome, "codex", "integration-journal.json"));
+      paths.add(path.join(coreHome, "codex", "integration-journal.recovery.json"));
+      paths.add(path.join(this.codexHome, "config.toml"));
+      paths.add(path.join(this.codexHome, "models_cache.json"));
+    }
+    if (scope === "provider") {
+      paths.add(path.join(coreHome, "secrets", "provider-api.key"));
+      const providerKeyFile = snapshot.config?.providerApi?.apiKeyFile;
+      if (typeof providerKeyFile === "string" && path.isAbsolute(providerKeyFile)) {
+        paths.add(providerKeyFile);
+      }
+    }
     if (snapshot.owner === "external" && this.platform === "darwin") {
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.daemon.plist"));
       paths.add(path.join(this.launchAgentsDir, "io.github.codex-chatgpt-web.tunnel.plist"));
@@ -682,6 +750,9 @@ class RuntimeHost {
 
   async setBridgeEnabled(enabled) {
     this.assertProductionProfile("Codex bridge routing");
+    if (this.providerModeConfigured()) {
+      throw new Error("Codex bridge routing is unavailable while Provider API mode is enabled");
+    }
     const desired = enabled === true;
     const name = desired ? "bridge-connect" : "bridge-disconnect";
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
@@ -847,7 +918,7 @@ class RuntimeHost {
       "--browser-host-descriptor",
       this.browserDescriptorPath,
       "--refresh-account-capabilities",
-      "--replace-codex-route",
+      this.providerModeConfigured() ? "--provider-mode" : "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
     ];
@@ -856,6 +927,31 @@ class RuntimeHost {
       message: "Installing ChatGPT Web models into Codex",
       successMessage: "Codex integration installed",
       timeoutMs: CORE_SETUP_TIMEOUT_MS,
+    });
+    return { ...result, mode };
+  }
+
+  async setupProvider() {
+    this.assertProductionProfile("Provider API setup");
+    if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
+    const existing = this.runtimeConfigSnapshot();
+    const mode = existing.mode;
+    const args = [
+      "setup",
+      mode === "full" ? "--full" : "--browser-only",
+      "--browser-host-descriptor",
+      this.browserDescriptorPath,
+      "--refresh-account-capabilities",
+      "--provider-mode",
+      "--acknowledge-unofficial",
+      "--restart-service",
+    ];
+    if (mode === "full") args.push("--app-name", this.browserConnectorName());
+    const result = await this.runSetup("provider-setup", args, {
+      message: "Enabling the independent Provider API",
+      successMessage: "Independent Provider API enabled",
+      timeoutMs: mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
+      checkpointScope: "provider",
     });
     return { ...result, mode };
   }
@@ -916,7 +1012,7 @@ class RuntimeHost {
       mode === "full" ? "--full" : "--browser-only",
       "--browser-host-descriptor",
       this.browserDescriptorPath,
-      "--replace-codex-route",
+      this.providerModeConfigured() ? "--provider-mode" : "--replace-codex-route",
       "--acknowledge-unofficial",
       "--restart-service",
       contextFlag,
@@ -942,7 +1038,10 @@ class RuntimeHost {
       || (existing.config?.releaseVersion === currentVersion && !connectorMigrationRequired)) {
       return { updated: false };
     }
-    const route = await this.bridgeStatus("runtime-upgrade-route");
+    const providerMode = existing.config?.providerApi?.enabled === true;
+    const route = providerMode
+      ? { installed: false, active: false, errors: [] }
+      : await this.bridgeStatus("runtime-upgrade-route");
     const args = [
       "setup",
       existing.mode === "full" ? "--full" : "--browser-only",
@@ -951,6 +1050,7 @@ class RuntimeHost {
       "--acknowledge-unofficial",
       "--restart-service",
     ];
+    if (providerMode) args.push("--provider-mode");
     if (existing.mode === "full") {
       args.push("--app-name", connectorNameForSetup(existing.config?.appName));
     }
@@ -959,11 +1059,12 @@ class RuntimeHost {
       successMessage: `Launcher runtime upgraded to ${currentVersion}`,
       timeoutMs: existing.mode === "full" ? MCP_SETUP_TIMEOUT_MS : CORE_SETUP_TIMEOUT_MS,
     });
-    if (!route.active) await this.setBridgeEnabled(false);
+    if (!providerMode && !route.active) await this.setBridgeEnabled(false);
     return {
       updated: true,
       mode: existing.mode,
       bridgeEnabled: route.active,
+      providerMode,
       fromVersion: existing.config.releaseVersion,
       toVersion: currentVersion,
       connectorMigrated: connectorMigrationRequired,
@@ -1050,7 +1151,8 @@ class RuntimeHost {
     const args = ["accounts", "update-identity", String(input.slotId)];
     if (input.email) args.push("--email", String(input.email));
     if (input.workspaceName) args.push("--workspace-name", String(input.workspaceName));
-    if (input.signedIn) args.push("--signed-in");
+    if (input.signedIn === true) args.push("--signed-in");
+    if (input.signedIn === false) args.push("--signed-out");
     if (args.length === 3) return { stdout: "" };
     return this.run("accounts-update-identity", args, { message: "Saving ChatGPT identity", timeoutMs: 15_000 });
   }
@@ -1146,7 +1248,7 @@ class RuntimeHost {
       this.browserDescriptorPath,
       "--app-name",
       this.browserConnectorName(),
-      "--replace-codex-route",
+      this.providerModeConfigured() ? "--provider-mode" : "--replace-codex-route",
     ];
     if (reuseSavedCredentials) {
       args.push("--acknowledge-unofficial", "--restart-service");
@@ -1232,7 +1334,7 @@ class RuntimeHost {
   async runSetup(name, args, options) {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const previousRuntime = this.runtimeConfigSnapshot();
-    const checkpoint = this.captureSetupCheckpoint(previousRuntime);
+    const checkpoint = this.captureSetupCheckpoint(previousRuntime, options.checkpointScope);
     this.lifecycleOperation = name;
     let setupCommandStarted = false;
     try {

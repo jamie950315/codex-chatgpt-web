@@ -10,6 +10,7 @@ function redactText(value) {
   const redacted = value
     .replace(/tunnel_[a-f0-9]{32}/g, "[tunnel-id]")
     .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "[runtime-key]")
+    .replace(/\bcwg_[A-Za-z0-9_-]{32,}\b/g, "[provider-key]")
     .replace(/\bBearer\s+[A-Za-z0-9._~-]{20,}\b/gi, "Bearer [redacted]");
   return redacted.length > MAX_LOG_STRING_CHARS
     ? `${redacted.slice(0, MAX_LOG_STRING_CHARS)}…[truncated]`
@@ -91,7 +92,7 @@ function sanitize(value, seen = new WeakSet()) {
   return Object.fromEntries(
     Object.entries(value).map(([key, item]) => [
       key,
-      /(?:authorization|cookie|runtimeKey|controlToken)/i.test(key)
+      /(?:authorization|cookie|runtimeKey|controlToken|apiKey)/i.test(key)
         ? "[redacted]"
         : sanitize(item, seen),
     ]),

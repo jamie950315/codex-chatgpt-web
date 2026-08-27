@@ -58,6 +58,7 @@ const COMPOSER_SELECTOR = [
   '[contenteditable="true"][role="textbox"]',
   "textarea",
 ].join(", ");
+const CHATGPT_EXPIRED_SESSION_PATTERN = /Your session has expired|你的工作階段已過期|您的工作階段已過期|你的会话已过期|您的会话已过期/i;
 const CHATGPT_VIEWPORT_CSS = `
   html,
   body {
@@ -94,15 +95,37 @@ function visibleElementScript(selector) {
   })`;
 }
 
+function isChatGptExpiredSessionText(text) {
+  return CHATGPT_EXPIRED_SESSION_PATTERN.test(String(text || ""));
+}
+
+function expiredSessionElementScript() {
+  return `Array.from(document.querySelectorAll('[role="alert"], [role="dialog"]'))
+    .some((element) => {
+      const style = getComputedStyle(element);
+      const expiredPattern = new RegExp(
+        ${JSON.stringify(CHATGPT_EXPIRED_SESSION_PATTERN.source)},
+        ${JSON.stringify(CHATGPT_EXPIRED_SESSION_PATTERN.flags)},
+      );
+      return element.isConnected
+        && style.display !== "none"
+        && style.visibility !== "hidden"
+        && style.opacity !== "0"
+        && expiredPattern.test(element.textContent || "");
+    })`;
+}
+
 function probeChatGptAuthentication(contents) {
   return contents.executeJavaScript(`(async () => {
     const expectedUrl = new URL(${JSON.stringify(TEMPORARY_CHAT_URL)});
     const readSurface = () => {
       const composer = ${visibleElementScript(COMPOSER_SELECTOR)};
+      const sessionExpired = ${expiredSessionElementScript()};
       const actualUrl = new URL(location.href);
       return {
         url: actualUrl.href,
         composer: Boolean(composer),
+        sessionExpired,
         temporary: actualUrl.origin === expectedUrl.origin
           && actualUrl.pathname === expectedUrl.pathname
           && actualUrl.searchParams.get("temporary-chat") === "true",
@@ -147,12 +170,18 @@ function probeChatGptAuthentication(contents) {
     return { ...readSurface(), sessionAuthenticated };
   })()`, true).then((result) => ({
     ...result,
-    authenticated: Boolean(result.composer && result.temporary && result.sessionAuthenticated),
+    authenticated: Boolean(
+      !result.sessionExpired
+      && result.composer
+      && result.temporary
+      && result.sessionAuthenticated,
+    ),
   })).catch(() => ({
     url: "",
     composer: false,
     temporary: false,
     sessionAuthenticated: false,
+    sessionExpired: false,
     readyState: "unknown",
     authenticated: false,
   }));
@@ -231,6 +260,11 @@ function accountIdentityUpdate(slotId, identity = {}) {
     workspaceName: identity.workspaceName,
     signedIn: true,
   };
+}
+
+function accountSessionExpiredUpdate(slotId, login = {}) {
+  if (login.code !== "chatgpt_session_expired") return null;
+  return { slotId, signedIn: false };
 }
 
 function createSerialTaskQueue() {
@@ -516,6 +550,7 @@ class BrowserHost {
       this.keepaliveTimer.unref?.();
     }
     await Promise.all(retired);
+    this.syncViewVisibility?.();
   }
 
   async readChatGptIdentity(contents) {
@@ -1072,7 +1107,9 @@ class BrowserHost {
       const loginView = this.keepaliveViews.get(this.loginPartition);
       if (loginView && !loginView.webContents.isDestroyed()) return loginView;
     }
-    return this.authView || this.selectedTurnTab()?.view || this.view;
+    const configuredHomeView = [...(this.keepaliveViews?.values?.() || [])]
+      .find((view) => view && !view.webContents.isDestroyed());
+    return this.authView || this.selectedTurnTab()?.view || configuredHomeView || this.view;
   }
 
   hideKeepaliveView(view) {
@@ -1106,7 +1143,12 @@ class BrowserHost {
     const showLogin = Boolean(
       visible && !this.authView && !selected && loginView && !loginView.webContents.isDestroyed(),
     );
-    this.view.setVisible(visible && !this.authView && !selected && !showLogin);
+    const configuredHomeView = !showLogin && !selected
+      ? [...(this.keepaliveViews?.values?.() || [])]
+        .find((view) => view && !view.webContents.isDestroyed())
+      : null;
+    const showConfiguredHome = Boolean(visible && !this.authView && configuredHomeView);
+    this.view.setVisible(visible && !this.authView && !selected && !showLogin && !showConfiguredHome);
     for (const tab of this.turnTabs.values()) {
       const tabVisible = visible && !this.authView && selected?.id === tab.id;
       tab.view.setBounds(tabVisible ? this.bounds : this.hiddenTurnBounds());
@@ -1115,6 +1157,9 @@ class BrowserHost {
     this.authView?.setVisible(visible);
     for (const [partition, view] of this.keepaliveViews || []) {
       if (showLogin && partition === this.loginPartition) {
+        view.setBounds(this.bounds);
+        view.setVisible(true);
+      } else if (showConfiguredHome && view === configuredHomeView) {
         view.setBounds(this.bounds);
         view.setVisible(true);
       } else {
@@ -1344,7 +1389,9 @@ class BrowserHost {
 
   async reveal() {
     this.show();
-    if (!this.selectedTurnTab() && this.view.webContents.getURL() === IDLE_BROWSER_URL) {
+    if (!this.selectedTurnTab()
+      && this.keepaliveViews.size === 0
+      && this.view.webContents.getURL() === IDLE_BROWSER_URL) {
       await this.view.webContents.loadURL(TEMPORARY_CHAT_URL);
       await this.probeAuthentication();
     }
@@ -1825,6 +1872,13 @@ class BrowserHost {
       await sleep(1500);
     }
     const authentication = await probeChatGptAuthentication(view.webContents);
+    if (authentication.sessionExpired) {
+      return {
+        status: "error",
+        code: "chatgpt_session_expired",
+        message: "The ChatGPT session has expired. Sign in again on this workspace.",
+      };
+    }
     if (authentication.authenticated) {
       return { status: "ok", message: "ChatGPT session is signed in" };
     }
@@ -1952,13 +2006,16 @@ class BrowserHost {
 
 module.exports = {
   accountIdentityUpdate,
+  accountSessionExpiredUpdate,
   allowedAuthUrl,
   BrowserHost,
   BrowserTurnCancelledError,
   CHATGPT_VIEWPORT_CSS,
   createSerialTaskQueue,
+  expiredSessionElementScript,
   IDLE_BROWSER_URL,
   isChatGptCloudflareChallengeResponse,
+  isChatGptExpiredSessionText,
   isTemporaryChatUrl,
   reconcileAccountValidationReport,
   TEMPORARY_CHAT_URL,

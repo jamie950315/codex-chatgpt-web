@@ -273,6 +273,16 @@ function validateConfig(config, descriptorPath, platform = process.platform, lau
     && typeof config.experimentalBiggerContext !== "boolean") {
     throw new Error("Runtime configuration has an invalid experimentalBiggerContext");
   }
+  if (config.providerApi !== undefined) {
+    if (!config.providerApi || typeof config.providerApi !== "object"
+      || typeof config.providerApi.enabled !== "boolean") {
+      throw new Error("Runtime configuration has an invalid Provider API configuration");
+    }
+    if (typeof config.providerApi.apiKeyFile !== "string"
+      || !absolutePath(config.providerApi.apiKeyFile, platform)) {
+      throw new Error("Runtime configuration has an invalid Provider API key path");
+    }
+  }
   if (config.proAvailable && !config.solAvailable) {
     throw new Error("Runtime configuration cannot enable Pro without Sol");
   }

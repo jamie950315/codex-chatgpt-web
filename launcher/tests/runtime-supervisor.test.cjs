@@ -153,6 +153,24 @@ test("launcher runtime ownership cannot cross production and DEV profiles", () =
   );
 });
 
+test("launcher runtime validates the owner-only Provider API key path", () => {
+  const descriptorPath = path.join(os.tmpdir(), "provider-launcher.json");
+  const providerConfig = launcherConfig(descriptorPath, {
+    providerApi: {
+      enabled: true,
+      apiKeyFile: path.join(os.tmpdir(), "provider-api.key"),
+    },
+  });
+  assert.deepEqual(validateConfig(providerConfig, descriptorPath).providerApi, providerConfig.providerApi);
+  assert.throws(
+    () => validateConfig({
+      ...providerConfig,
+      providerApi: { enabled: true, apiKeyFile: "relative/provider-api.key" },
+    }, descriptorPath),
+    /invalid Provider API key path/,
+  );
+});
+
 test("DEV runtime supervision starts only the isolated MCP tunnel", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-dev-tunnel-supervisor-"));
   const descriptorPath = path.join(root, "runtime", "launcher-browser.json");

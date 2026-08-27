@@ -12,15 +12,15 @@ const {
   sanitize,
 } = require("../electron/logging.cjs");
 
-test("launcher logs redact tunnel ids, runtime keys, and bearer credentials", () => {
+test("launcher logs redact tunnel ids, runtime keys, Provider keys, and bearer credentials", () => {
   assert.deepEqual(sanitize({
-    line: "tunnel_0123456789abcdef0123456789abcdef sk-exampleRuntimeSecret123",
+    line: "tunnel_0123456789abcdef0123456789abcdef sk-exampleRuntimeSecret123 cwg_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
     authorization: "Bearer this-must-never-be-recorded",
-    nested: { controlToken: "also-secret" },
+    nested: { controlToken: "also-secret", providerApiKey: "custom-provider-secret" },
   }), {
-    line: "[tunnel-id] [runtime-key]",
+    line: "[tunnel-id] [runtime-key] [provider-key]",
     authorization: "[redacted]",
-    nested: { controlToken: "[redacted]" },
+    nested: { controlToken: "[redacted]", providerApiKey: "[redacted]" },
   });
 });
 

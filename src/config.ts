@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, openSync, closeSync, renameSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep, win32 } from "node:path";
 import { tmpdir } from "node:os";
@@ -84,6 +84,10 @@ export interface AppConfig {
   experimentalBiggerContext: boolean;
   autoApproveToolCalls: boolean;
   controlToken: string;
+  providerApi?: {
+    enabled: boolean;
+    apiKeyFile: string;
+  };
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
   tunnel?: TunnelConfig;
@@ -104,6 +108,10 @@ export function getConfigDir(): string {
 
 export function getConfigPath(): string {
   return join(getConfigDir(), "config.json");
+}
+
+export function defaultProviderApiKeyPath(): string {
+  return join(getConfigDir(), "secrets", "provider-api.key");
 }
 
 export function isWindowsPipeEndpoint(value: string): boolean {
@@ -416,6 +424,16 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && typeof parsed.experimentalBiggerContext !== "boolean") {
     throw new Error(`Invalid experimentalBiggerContext in ${path}`);
   }
+  if (parsed.providerApi !== undefined) {
+    if (!parsed.providerApi || typeof parsed.providerApi !== "object"
+      || typeof parsed.providerApi.enabled !== "boolean") {
+      throw new Error(`Invalid providerApi in ${path}`);
+    }
+    if (typeof parsed.providerApi.apiKeyFile !== "string"
+      || !isAbsolute(expandUserPath(parsed.providerApi.apiKeyFile))) {
+      throw new Error(`Invalid providerApi.apiKeyFile in ${path}`);
+    }
+  }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
@@ -433,6 +451,33 @@ function parseConfig(value: unknown, path: string): AppConfig {
     ...(accountRotation ? { accountRotation } : {}),
     experimentalBiggerContext,
   } as AppConfig;
+}
+
+export function readProviderApiKey(config: AppConfig): string {
+  const keyFile = config.providerApi?.apiKeyFile;
+  if (!config.providerApi?.enabled || !keyFile) throw new Error("Provider API is not enabled");
+  const path = resolve(expandUserPath(keyFile));
+  const stat = statSync(path);
+  if (!stat.isFile()) throw new Error("Provider API key path is not a file");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error("Provider API key file must be readable only by its owner");
+  }
+  const key = readFileSync(path, "utf8").trim();
+  if (!/^[A-Za-z0-9_-]{40,}$/.test(key)) throw new Error("Provider API key is invalid");
+  return key;
+}
+
+export function ensureProviderApiKeyFile(existingPath?: string): string {
+  const path = resolve(expandUserPath(existingPath || defaultProviderApiKeyPath()));
+  if (existsSync(path)) {
+    readProviderApiKey({
+      ...defaultConfig("browser-only"),
+      providerApi: { enabled: true, apiKeyFile: path },
+    });
+    return path;
+  }
+  atomicWriteFile(path, `cwg_${randomBytes(32).toString("base64url")}\n`);
+  return path;
 }
 
 export function saveConfig(config: AppConfig): void {
