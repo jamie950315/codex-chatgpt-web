@@ -106,6 +106,7 @@ export const CHATGPT_TOOL_CONFIRMATION_TIMEOUT_MS = 60_000;
 export const MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS = 3;
 const CHATGPT_SMOKE_TEXT = "Reply with exactly: CODEX WEB GPT READY";
 const CHATGPT_SMOKE_EXPECTED = "CODEX WEB GPT READY";
+const CHATGPT_CONNECTOR_CATALOG_PATH = "/backend-api/aip/connectors/links/list_accessible";
 /**
  * ChatGPT applies composer state asynchronously, and a fast host can reach the next step before the
  * editor has taken the previous one. This is headroom for that, not a readiness check.
@@ -115,6 +116,29 @@ export const CHATGPT_UI_SETTLE_MS = 250;
 const settleChatGptUi = (): Promise<void> => (
   new Promise(resolveSettle => setTimeout(resolveSettle, CHATGPT_UI_SETTLE_MS))
 );
+
+export function chatGptAutoInvocableConnectorName(
+  catalog: unknown,
+  appName: string,
+): string | undefined {
+  if (!catalog || typeof catalog !== "object" || Array.isArray(catalog)) return undefined;
+  const links = (catalog as Record<string, unknown>).links;
+  if (!Array.isArray(links)) return undefined;
+  const matches = links.filter(link => {
+    if (!link || typeof link !== "object" || Array.isArray(link)) return false;
+    const candidate = link as Record<string, unknown>;
+    const connectorIdentity = typeof candidate.connector_name === "string"
+      ? candidate.connector_name
+      : candidate.name;
+    return connectorIdentity === appName
+      && candidate.auth_status === "ACTIVE"
+      && candidate.visibility === "VISIBLE"
+      && candidate.connector_status === "ENABLED"
+      && candidate.connector_type === "MCP"
+      && candidate.disable_auto_invocation === false;
+  });
+  return matches.length === 1 ? appName : undefined;
+}
 
 interface ConnectorMentionHost {
   config: { appName: string };
@@ -1075,6 +1099,7 @@ export class ChatGptBrowserWorker {
   private launcherHelper?: LauncherBrowserHelperClient;
   private maintenanceTail: Promise<void> = Promise.resolve();
   private readonly activeRuns = new Map<string, Promise<string>>();
+  private readonly autoInvocationConnectorPages = new WeakSet<Page>();
 
   private constructor(readonly config: ResolvedBrowserConfig) {}
 
@@ -1486,17 +1511,44 @@ export class ChatGptBrowserWorker {
   private async prepareTemporaryChatSurface(
     page: Page,
     captureDiagnostic?: (checkpoint: string) => Promise<void>,
+    inspectAutoInvocationConnector = false,
   ): Promise<Locator> {
     // Launcher verification refreshes its owned page before attaching Playwright so a newly added
     // connector is present in the catalog. Navigating again here destroys that freshly hydrated
     // document and made the first verification race a second SPA bootstrap. A leased turn starts on
     // about:blank and therefore still performs exactly one navigation through this same method.
+    const connectorCatalog = inspectAutoInvocationConnector
+      ? page.waitForResponse(response => {
+        try {
+          return new URL(response.url()).pathname === CHATGPT_CONNECTOR_CATALOG_PATH
+            && response.request().method() === "POST";
+        } catch {
+          return false;
+        }
+      }, { timeout: 15_000 }).then(async response => {
+        if (response.status() !== 200) return undefined;
+        const body = await response.json().catch(() => undefined) as unknown;
+        return chatGptAutoInvocableConnectorName(body, this.config.appName);
+      }).catch(() => undefined)
+      : undefined;
     if (page.url() !== CHATGPT_TEMPORARY_CHAT_URL) {
       await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
       await captureDiagnostic?.("temporary-chat-navigation-complete");
+    } else if (inspectAutoInvocationConnector) {
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
+      await captureDiagnostic?.("temporary-chat-navigation-complete");
+    }
+    if (connectorCatalog) {
+      const connectorName = await connectorCatalog;
+      if (connectorName === this.config.appName) {
+        this.autoInvocationConnectorPages.add(page);
+        await captureDiagnostic?.("connector-auto-invocation-available");
+      } else {
+        this.autoInvocationConnectorPages.delete(page);
+      }
     }
     let composer: Locator;
     try {
@@ -1665,6 +1717,10 @@ export class ChatGptBrowserWorker {
     return exactMatches === 1;
   }
 
+  private connectorUsesAutoInvocation(page: Page): boolean {
+    return this.autoInvocationConnectorPages.has(page);
+  }
+
   private async connectorMentionRowTitles(menuRows: Locator): Promise<string[]> {
     const texts = await menuRows.filter({ visible: true }).allInnerTexts().catch(() => [] as string[]);
     return texts
@@ -1772,6 +1828,16 @@ export class ChatGptBrowserWorker {
       // then transport the complete text through the browser's plain-text editing command.
       await composer.fill("");
       await composer.focus();
+      await this.insertPromptText(page, prompt, abortSignal);
+      await this.assertPromptAttached(page, prompt, abortSignal);
+      return;
+    }
+    if (this.connectorUsesAutoInvocation(page)) {
+      const composer = await this.activeComposer(page);
+      await composer.fill("");
+      await composer.focus();
+      await page.keyboard.press(CHATGPT_COMPOSER_DOCUMENT_END_KEY);
+      await captureDiagnostic?.("connector-auto-invocation-selected");
       await this.insertPromptText(page, prompt, abortSignal);
       await this.assertPromptAttached(page, prompt, abortSignal);
       return;
@@ -1972,12 +2038,12 @@ export class ChatGptBrowserWorker {
 
   private async verifyConnectorExclusive(): Promise<string> {
     const page = await this.ensurePage();
-    await this.prepareTemporaryChatSurface(page);
-    // Account/workspace validation only needs the connector to appear in this ChatGPT
-    // workspace's @ mention catalog. Forcing the selected pill is what real turns do; extra
-    // Electron partitions often open the catalog and then fail to attach the chip.
+    await this.prepareTemporaryChatSurface(page, undefined, true);
+    // New ChatGPT surfaces auto-invoke enabled MCP connectors without exposing them in the @ menu.
+    // Older surfaces still use the mention catalog, so retain that path as a compatibility fallback.
     const composer = await this.activeComposer(page);
     await composer.fill("");
+    if (this.connectorUsesAutoInvocation(page)) return this.config.appName;
     if (await this.connectorIsSelected(composer)) return this.config.appName;
     await waitForConnectorMention({
       config: this.config,
@@ -2523,6 +2589,7 @@ export class ChatGptBrowserWorker {
         () => this.prepareTemporaryChatSurface(
           page,
           checkpoint => diagnostics.capture(page, checkpoint),
+          requestedMode.localTools,
         ),
       );
       let mode = await this.runStage(turn.traceId, "effort_selection", browserStageTimeouts.effortSelection, () => (
@@ -2632,10 +2699,10 @@ export class ChatGptBrowserWorker {
             "connector_catalog_refresh",
             browserStageTimeouts.temporaryChatPreparation,
             async () => {
-              await page.reload({ waitUntil: "domcontentloaded", timeout: 60_000 });
               await this.prepareTemporaryChatSurface(
                 page,
                 checkpoint => diagnostics.capture(page, checkpoint),
+                requestedMode.localTools,
               );
               mode = await this.selectModelAndEffort(
                 page,

@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import type { Page } from "playwright-core";
-import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptNewTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
+import { CHATGPT_COMPOSER_DOCUMENT_END_KEY, CHATGPT_STOPPED_THINKING_GRACE_MS, ChatGptBrowserWorker, ChatGptPromptAttachmentIntegrityError, ChatGptStoppedThinkingTracker, ChatGptTurnDomHealthTracker, ChatGptVisibleTraceTracker, MAX_CHATGPT_BROWSER_TABS, MAX_CHATGPT_CONNECTOR_TRIGGER_ATTEMPTS, assertChatGptWebInputWithinLimits, assertChatGptWebMultipartInputWithinLimits, browserDiagnosticCheckpoint, browserDiagnosticIncludesScreenshot, chatGptAutoInvocableConnectorName, chatGptNewTurnIdentity, chatGptSubmissionEvidence, dismissChatGptTemporaryChatOnboarding, isChatGptTraceControl, redactChatGptUiDiagnostic, resolveBrowserConfig, resolveChatGptToolConfirmation, resolveChatGptWebMultipartStagingMode, stripChatGptTraceControlSuffix, throwIfChatGptRateLimitDialog, throwIfChatGptSessionFailureAlert, throwIfChatGptTerminalErrorAlert } from "../src/adapters/chatgpt-web/browser-worker";
 import { chatGptStoppedThinkingError } from "../src/adapters/chatgpt-web/adapter-error";
 import { CHATGPT_WEB_MODEL_ID } from "../src/adapters/chatgpt-web/model";
 import { CHATGPT_CONNECTOR_NAME, DEV_CHATGPT_CONNECTOR_NAME, defaultChromeExecutable, legacyChatGptConnectorMigrationMessage } from "../src/config";
@@ -155,6 +155,43 @@ test("connector verification reports a legacy-only ChatGPT menu as a migration e
   expect(mixedMessage).not.toContain("Legacy ChatGPT connector");
   expect(mixedMessage).toContain('no row named "Codex Native2"');
   expect(mixedMessage).not.toContain("Private chat title");
+});
+
+test("connector catalog accepts exactly one active visible enabled MCP connector with auto invocation", () => {
+  const valid = {
+    links: [{
+      name: CHATGPT_CONNECTOR_NAME,
+      auth_status: "ACTIVE",
+      visibility: "VISIBLE",
+      connector_status: "ENABLED",
+      connector_type: "MCP",
+      disable_auto_invocation: false,
+    }],
+  };
+  expect(chatGptAutoInvocableConnectorName(valid, CHATGPT_CONNECTOR_NAME)).toBe(CHATGPT_CONNECTOR_NAME);
+  expect(chatGptAutoInvocableConnectorName({
+    links: [{
+      ...valid.links[0],
+      name: "Codex Native 2",
+      connector_name: CHATGPT_CONNECTOR_NAME,
+    }],
+  }, CHATGPT_CONNECTOR_NAME)).toBe(CHATGPT_CONNECTOR_NAME);
+
+  for (const invalid of [
+    { links: [] },
+    { links: [valid.links[0], valid.links[0]] },
+    { links: [{ ...valid.links[0], auth_status: "EXPIRED" }] },
+    { links: [{ ...valid.links[0], visibility: "HIDDEN" }] },
+    { links: [{ ...valid.links[0], connector_status: "DISABLED" }] },
+    { links: [{ ...valid.links[0], connector_type: "OAUTH" }] },
+    { links: [{ ...valid.links[0], disable_auto_invocation: true }] },
+    { links: [{ ...valid.links[0], name: "Visualize" }] },
+    { links: [{ ...valid.links[0], connector_name: "Another connector" }] },
+    { links: "not-an-array" },
+    null,
+  ]) {
+    expect(chatGptAutoInvocableConnectorName(invalid, CHATGPT_CONNECTOR_NAME)).toBeUndefined();
+  }
 });
 
 test("browser stage timeout aborts late page acquisition", async () => {
@@ -666,6 +703,7 @@ test("connector verification preserves the host-refreshed catalog evidence", asy
       calls.push(`prepare:${prepared}`);
     },
     activeComposer: async () => selected ? selectedComposer : initialComposer,
+    connectorUsesAutoInvocation: () => false,
     connectorIsSelected: async () => selected,
     connectorMentionFailure: prototype.connectorMentionFailure,
     connectorMentionRowTitles: prototype.connectorMentionRowTitles,
@@ -717,6 +755,7 @@ test("connector verification succeeds from the mention catalog without attaching
     ensurePage: async () => page,
     prepareTemporaryChatSurface: async () => { calls.push("prepare"); },
     activeComposer: async () => composer,
+    connectorUsesAutoInvocation: () => false,
     connectorIsSelected: async () => false,
   });
   expect(selected).toBe("Codex Native2");
@@ -856,6 +895,7 @@ test("tool-capable prompts use the shared Playwright connector selection before 
   let activeComposerCalls = 0;
   await attachPrompt.call({
     config: { appName: "Codex Native2" },
+    connectorUsesAutoInvocation: () => false,
     selectConnector,
     insertPromptText,
     connectorIsSelected: async () => selected,
@@ -880,6 +920,43 @@ test("tool-capable prompts use the shared Playwright connector selection before 
     ["selectedFocus"],
     ["plainText", " context"],
     ["assertPrompt"],
+  ]);
+});
+
+test("tool-capable prompts use an enabled auto-invocation connector without requiring a mention pill", async () => {
+  const calls: Array<[string, string?]> = [];
+  const composer = {
+    fill: async (value: string) => { calls.push(["fill", value]); },
+    focus: async () => { calls.push(["focus"]); },
+  };
+  const page = {
+    keyboard: {
+      press: async (key: string) => { calls.push(["press", key]); },
+    },
+  };
+  const attachPrompt = (ChatGptBrowserWorker.prototype as unknown as {
+    attachPrompt(page: unknown, prompt: string, localTools: boolean): Promise<void>;
+  }).attachPrompt;
+
+  await attachPrompt.call({
+    connectorUsesAutoInvocation: (candidate: unknown) => {
+      expect(candidate).toBe(page);
+      return true;
+    },
+    activeComposer: async () => composer,
+    selectConnector: async () => {
+      throw new Error("auto-invocation must not depend on the removed mention menu");
+    },
+    insertPromptText: async (_page: unknown, text: string) => { calls.push(["plainText", text]); },
+    assertPromptAttached: async (_page: unknown, text: string) => { calls.push(["assertPrompt", text]); },
+  }, page, "context", true);
+
+  expect(calls).toEqual([
+    ["fill", ""],
+    ["focus"],
+    ["press", CHATGPT_COMPOSER_DOCUMENT_END_KEY],
+    ["plainText", "context"],
+    ["assertPrompt", "context"],
   ]);
 });
 

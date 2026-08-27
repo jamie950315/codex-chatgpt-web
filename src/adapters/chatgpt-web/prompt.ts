@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { CodexAssistantContentPart, CodexContentPart, CodexMessage, CodexParsedRequest } from "../../types";
 import { isOnePixelPngDataUrl, isReadableCompactionSummaryText } from "../../responses/compaction";
+import { CHATGPT_CONNECTOR_NAME } from "../../config";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import {
   CHATGPT_LUNA_CHECKPOINT_MARKER,
@@ -400,6 +401,7 @@ export function compileChatGptWebPrompt(
     : mode.localTools
     ? [
       "For local work required by the task, use the attached Codex Native tools directly according to their declared descriptions and schemas.",
+      `Use the enabled ${JSON.stringify(CHATGPT_CONNECTOR_NAME)} MCP connector whenever a Codex Native tool is required; ChatGPT may auto-invoke it without showing a connector mention pill.`,
       "Use actual Codex Native results as evidence for local observations and effects, and keep calling tools until the requested work is complete and verified.",
     ]
     : [
