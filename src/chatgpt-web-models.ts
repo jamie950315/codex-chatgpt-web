@@ -230,6 +230,12 @@ export function isChatGptWebModelSlug(modelId: string): boolean {
   return modelId.startsWith(CHATGPT_WEB_MODEL_PREFIX);
 }
 
+export function isChatGptWebProviderModelId(modelId: string): boolean {
+  return isChatGptWebModelSlug(modelId)
+    || modelId === CHATGPT_WEB_BACKEND_MODEL
+    || modelId === CHATGPT_WEB_LUNA_BACKEND_MODEL;
+}
+
 export function availableChatGptWebModelRoutes(
   capabilities: ChatGptWebAccountCapabilities,
 ): readonly ChatGptWebModelRoute[] {
@@ -237,6 +243,13 @@ export function availableChatGptWebModelRoutes(
   return capabilities.proAvailable
     ? CHATGPT_WEB_MODEL_ROUTES
     : CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro);
+}
+
+export function availableChatGptWebProviderModelIds(): readonly string[] {
+  // Provider discovery is a stable product contract rather than a snapshot of the account chosen
+  // for the next rotated turn. Runtime routing still returns the exact capability error when no
+  // currently available workspace can serve a selected effort.
+  return CHATGPT_WEB_MODEL_ROUTES.map(route => route.slug);
 }
 
 export function requireChatGptWebModelRoute(
@@ -258,4 +271,32 @@ export function requireChatGptWebModelRoute(
     throw new Error(`${route.displayName} is not available for this account`);
   }
   return route;
+}
+
+export function requireChatGptWebProviderModelRoute(
+  modelId: string,
+  reasoning: string | undefined,
+  capabilities: ChatGptWebAccountCapabilities,
+): ChatGptWebModelRoute {
+  if (isChatGptWebModelSlug(modelId)) return requireChatGptWebModelRoute(modelId, capabilities);
+  if (modelId === CHATGPT_WEB_LUNA_BACKEND_MODEL) {
+    return requireChatGptWebModelRoute(CHATGPT_WEB_LUNA_MODEL_ROUTE.slug, capabilities);
+  }
+  if (modelId !== CHATGPT_WEB_BACKEND_MODEL) {
+    throw new Error(`ChatGPT web model is not enabled: ${modelId}`);
+  }
+
+  const slug = reasoning === undefined || reasoning === "medium"
+    ? "chatgpt-web/medium"
+    : reasoning === "low"
+      ? "chatgpt-web/light"
+      : reasoning === "high"
+        ? "chatgpt-web/high"
+        : reasoning === "xhigh"
+          ? "chatgpt-web/extra-high"
+          : reasoning === "max" || reasoning === "ultra"
+            ? "chatgpt-web/pro"
+            : undefined;
+  if (!slug) throw new Error(`ChatGPT Web Sol does not support reasoning effort: ${reasoning}`);
+  return requireChatGptWebModelRoute(slug, capabilities);
 }

@@ -3,7 +3,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { verifyConnectorWithBrowserHelper } = require("../electron/browser-helper-verifier.cjs");
+const {
+  runBrowserHelperOperation,
+  verifyConnectorWithBrowserHelper,
+} = require("../electron/browser-helper-verifier.cjs");
 
 test("launcher verification delegates exact connector selection to the browser helper protocol", async (context) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-browser-helper-verify-"));
@@ -58,4 +61,30 @@ test("launcher verification consumes a helper input EOF after the result", async
   });
 
   assert.deepEqual(result, { ok: true, appName: "Codex Native2" });
+});
+
+test("account validation abort stops an in-flight browser helper", async (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-browser-helper-abort-"));
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const script = path.join(root, "helper.cjs");
+  fs.writeFileSync(script, `
+    const input = require("node:readline").createInterface({ input: process.stdin });
+    process.stdout.write(JSON.stringify({ type: "ready" }) + "\\n");
+    input.on("line", line => {
+      const message = JSON.parse(line);
+      if (message.type === "shutdown") process.exit(0);
+    });
+  `);
+  const controller = new AbortController();
+  const operation = runBrowserHelperOperation({
+    helper: { executable: process.execPath, script },
+    descriptorPath: "/runtime/launcher-browser.json",
+    appName: "Codex Native2",
+    operation: "verify",
+    abortSignal: controller.signal,
+    logger: { info() {} },
+  });
+  setTimeout(() => controller.abort(), 30);
+
+  await assert.rejects(operation, /cancelled/i);
 });

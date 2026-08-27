@@ -171,6 +171,29 @@ test("provider mode publishes an authenticated OpenAI model list without native 
   });
 });
 
+test("provider mode keeps the five stable namespaced model IDs when cached capabilities are stale", async () => {
+  const config = defaultConfig("browser-only");
+  config.solAvailable = false;
+  config.proAvailable = false;
+  enableProviderApi(config);
+
+  const response = await modelsRequest(new Request("http://127.0.0.1:17841/v1/models", {
+    headers: { authorization: "Bearer provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz" },
+  }), config);
+
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    object: "list",
+    data: [
+      { id: "chatgpt-web/light", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/medium", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/high", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/extra-high", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/pro", object: "model", owned_by: "chatgpt-web" },
+    ],
+  });
+});
+
 test("provider mode rejects model discovery without its exact Bearer key", async () => {
   const config = defaultConfig("browser-only");
   enableProviderApi(config);

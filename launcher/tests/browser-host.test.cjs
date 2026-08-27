@@ -380,6 +380,133 @@ test("session inspection fails closed on incomplete shared-helper capability evi
   );
 });
 
+test("capability inspection targets a configured rotation workspace surface instead of the base session", async () => {
+  const calls = [];
+  const contents = {
+    url: "https://chatgpt.com/",
+    isDestroyed: () => false,
+    setBackgroundThrottling: value => calls.push(["throttle", value]),
+    loadURL: async url => { contents.url = url; calls.push(["load", url]); },
+    getURL: () => contents.url,
+    focus: () => calls.push(["focus"]),
+    executeJavaScript: async (_script, userGesture) => calls.push(["surface", userGesture]),
+  };
+  const configuredView = {
+    webContents: contents,
+    setBounds: bounds => calls.push(["bounds", bounds]),
+    setVisible: visible => calls.push(["visible", visible]),
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    getConnectorName: () => "Codex Native2",
+    logger: { info() {} },
+    partition: "persist:codex-web-gpt-chatgpt",
+    loginPartition: null,
+    keepaliveViews: new Map([["persist:codex-web-gpt-chatgpt-slot_uk", configuredView]]),
+    view: { webContents: { getURL: () => "https://chatgpt.com/legacy-base" } },
+    hiddenTurnBounds: () => ({ x: 0, y: 0, width: 1280, height: 900 }),
+    hideKeepaliveView: view => calls.push(["hide", view === configuredView]),
+    refreshChatGptHomeDocument: async () => { throw new Error("base session must not be refreshed"); },
+    runBrowserHelperOperation: async options => {
+      calls.push(["helper", options]);
+      return { type: "result", value: {
+        authenticated: true,
+        temporary: true,
+        url: "https://chatgpt.com/?temporary-chat=true",
+        solAvailable: true,
+        proAvailable: false,
+      } };
+    },
+  });
+
+  const inspected = await BrowserHost.prototype.runSessionInspection.call(fixture, true);
+
+  assert.equal(inspected.solAvailable, true);
+  const helperOptions = calls.find(([type]) => type === "helper")?.[1];
+  assert.equal(typeof helperOptions.surfaceId, "string");
+  assert.ok(helperOptions.surfaceId.length >= 24);
+  assert.deepEqual(calls.find(([type]) => type === "bounds")?.[1], { x: -1600, y: 0, width: 1280, height: 900 });
+  assert.equal(calls.some(([type, value]) => type === "visible" && value === true), true);
+  assert.equal(calls.some(([type, hidden]) => type === "hide" && hidden === true), true);
+});
+
+test("capability inspection tries another configured workspace and never falls back to base", async () => {
+  const inspected = [];
+  const makeView = (id) => ({
+    webContents: {
+      id,
+      url: "https://chatgpt.com/",
+      isDestroyed: () => false,
+      setBackgroundThrottling() {},
+      async loadURL(url) { this.url = url; },
+      getURL() { return this.url; },
+      focus() {},
+      async executeJavaScript() {},
+    },
+    setBounds() {},
+    setVisible() {},
+  });
+  const first = makeView("first");
+  const second = makeView("second");
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    helper: { executable: "/runtime/electron", script: "/runtime/browser-helper.cjs" },
+    descriptorPath: "/runtime/launcher-browser.json",
+    getConnectorName: () => "Codex Native2",
+    logger: { info() {}, warn() {} },
+    keepaliveViews: new Map([["first", first], ["second", second]]),
+    view: { webContents: { getURL: () => "https://chatgpt.com/legacy-base" } },
+    hiddenTurnBounds: () => ({ x: 0, y: 0, width: 1280, height: 900 }),
+    hideKeepaliveView() {},
+    refreshChatGptHomeDocument: async () => { throw new Error("base session must not be refreshed"); },
+    runBrowserHelperOperation: async ({ surfaceId }) => {
+      const id = surfaceId ? (inspected.length === 0 ? "first" : "second") : "base";
+      inspected.push(id);
+      if (id === "first") throw new Error("first workspace expired");
+      return { type: "result", value: {
+        authenticated: true,
+        temporary: true,
+        url: "https://chatgpt.com/?temporary-chat=true",
+        solAvailable: true,
+        proAvailable: true,
+      } };
+    },
+  });
+
+  const result = await BrowserHost.prototype.runSessionInspection.call(fixture, true);
+
+  assert.equal(result.proAvailable, true);
+  assert.deepEqual(inspected, ["first", "second"]);
+});
+
+test("capability inspection fails closed when configured rotation views are unavailable", async () => {
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    keepaliveViews: new Map([["destroyed", { webContents: { isDestroyed: () => true } }]]),
+    view: { webContents: { getURL: () => "https://chatgpt.com/legacy-base" } },
+    refreshChatGptHomeDocument: async () => { throw new Error("base session must not be refreshed"); },
+  });
+
+  await assert.rejects(
+    BrowserHost.prototype.runSessionInspection.call(fixture, true),
+    /configured rotation workspace/i,
+  );
+});
+
+test("capability inspection never falls back to base when rotation keepalive creation failed", async () => {
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    rotationConfigured: true,
+    keepaliveViews: new Map(),
+    getConnectorName: () => "Codex Native2",
+    view: { webContents: { getURL: () => "https://chatgpt.com/legacy-base" } },
+    refreshChatGptHomeDocument: async () => { throw new Error("base session must not be refreshed"); },
+  });
+
+  await assert.rejects(
+    BrowserHost.prototype.runSessionInspection.call(fixture, true),
+    /configured rotation workspace/i,
+  );
+});
+
 test("browser surface reactivation preserves its last measured bounds", () => {
   const visibility = [];
   const fixture = {
@@ -666,6 +793,34 @@ test("workspace validation rejects an expired-session modal even when composer a
     code: "chatgpt_session_expired",
     message: "The ChatGPT session has expired. Sign in again on this workspace.",
   });
+});
+
+test("workspace validation rejects an explicitly expired session API without a modal", async () => {
+  const fixture = {
+    partition: "persist:primary",
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        executeJavaScript: async () => ({
+          composer: true,
+          temporary: true,
+          sessionAuthenticated: false,
+          sessionApiExpired: true,
+          sessionExpired: false,
+          readyState: "complete",
+          url: "https://chatgpt.com/?temporary-chat=true",
+        }),
+      },
+    },
+  };
+
+  const result = await BrowserHost.prototype.probePartitionLogin.call(
+    fixture,
+    "persist:primary",
+  );
+
+  assert.equal(result.code, "chatgpt_session_expired");
 });
 
 test("authentication windows stay inside the launcher-owned browser partition", () => {

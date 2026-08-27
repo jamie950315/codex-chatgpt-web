@@ -43,6 +43,10 @@ import {
 import { connectConfiguredTunnels, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
 import { getTunnelServiceStatus, installTunnelService, restartTunnelService, stopTunnelService, tunnelServiceDefinitionMatches, uninstallTunnelService } from "./tunnel-service";
 import { VERSION } from "./version";
+import {
+  applyCockpitProviderModelCatalogSync,
+  prepareCockpitProviderModelCatalogSync,
+} from "./provider-model-catalog-sync";
 
 export interface SetupOptions {
   mode: RuntimeMode;
@@ -341,6 +345,12 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
   });
   delete config.purpose;
+  // Parse and fully prepare the owned Cockpit catalog before creating Provider credentials,
+  // changing runtime state, or touching a tunnel. A malformed owned catalog must fail setup with
+  // no partial Provider installation.
+  const providerCatalogPlan = options.providerMode
+    ? prepareCockpitProviderModelCatalogSync(config)
+    : undefined;
   if (options.providerMode) {
     config.providerApi = {
       enabled: true,
@@ -494,6 +504,10 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     installCodexIntegration(config, {
       replaceExistingRoute: options.replaceCodexRoute,
     });
+  } else {
+    // Provider mode keeps Cockpit as Codex's only backend. Synchronize only Cockpit's owned model
+    // catalog after setup has otherwise completed, without changing config.toml or its route.
+    applyCockpitProviderModelCatalogSync(providerCatalogPlan!);
   }
 
   return {

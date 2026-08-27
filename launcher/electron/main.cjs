@@ -100,6 +100,12 @@ let lastOperation = null;
 let catalogVerificationTimer = null;
 let catalogVerificationInFlight = false;
 let updateController = null;
+let accountValidationAbortController = null;
+let accountValidationPromise = null;
+
+function throwIfAccountValidationAborted(signal) {
+  if (signal?.aborted) throw new Error("Account validation was cancelled");
+}
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -404,7 +410,11 @@ function registerIpc({ logger, stateStore }) {
   handle("launcher:set-language", (_event, language) => stateStore.update({ language: validateLanguage(language) }));
   handle("launcher:provider-setup", async () => {
     if (IS_DEV_PROFILE) throw new Error("Provider API is unavailable in the isolated DEV launcher profile");
-    if (!browserHost?.snapshot()?.authenticated) throw new Error("Sign in to ChatGPT before enabling Provider API");
+    const rotationConfigured = runtimeHost.hasRotationWorkspaces();
+    const signedIn = rotationConfigured
+      ? runtimeHost.hasSignedInRotationWorkspace()
+      : browserHost?.snapshot()?.authenticated === true;
+    if (!signedIn) throw new Error("Sign in to a configured ChatGPT workspace before enabling Provider API");
     const provider = await providerController.setup();
     const state = stateStore.update({
       bridgeEnabled: false,
@@ -525,7 +535,12 @@ function registerIpc({ logger, stateStore }) {
     });
   });
   handle("launcher:accounts-validate", async () => {
+    if (accountValidationPromise) throw new Error("Account validation is already running");
+    const controller = new AbortController();
+    accountValidationAbortController = controller;
+    const validation = (async () => {
     await accountIdentityCaptures.wait();
+    throwIfAccountValidationAborted(controller.signal);
     try {
       await runtimeSupervisor.startIfConfigured();
     } catch (error) {
@@ -535,6 +550,7 @@ function registerIpc({ logger, stateStore }) {
     }
     const listed = runtimeHost.listAccounts();
     const staticResult = await runtimeHost.validateAccounts();
+    throwIfAccountValidationAborted(controller.signal);
     let report;
     try {
       const stdout = String(staticResult.stdout || "");
@@ -549,12 +565,14 @@ function registerIpc({ logger, stateStore }) {
       const listedAccount = (listed.accounts || []).find((item) => item.id === account.id);
       const workspaces = [];
       for (const workspace of account.workspaces || []) {
+        throwIfAccountValidationAborted(controller.signal);
         const listedWorkspace = (listedAccount?.workspaces || []).find((item) => item.id === workspace.id);
         const partition = listedWorkspace?.partition;
         let login = workspace.login || { status: "error", message: "Not signed in to ChatGPT on this workspace" };
         try {
-          if (partition) login = await browserHost.probePartitionLogin(partition);
+          if (partition) login = await browserHost.probePartitionLogin(partition, controller.signal);
         } catch (error) {
+          throwIfAccountValidationAborted(controller.signal);
           login = {
             status: "error",
             message: error instanceof Error ? error.message : String(error),
@@ -578,9 +596,10 @@ function registerIpc({ logger, stateStore }) {
             connector = { status: "skipped", message: "Browser-only mode has no MCP connector" };
           } else {
             try {
-              await browserHost.runConnectorVerification(connectorName, partition);
+              await browserHost.runConnectorVerification(connectorName, partition, controller.signal);
               connector = { status: "ok", message: `Codex connector ${JSON.stringify(connectorName)} is available` };
             } catch (error) {
+              throwIfAccountValidationAborted(controller.signal);
               connector = {
                 status: "error",
                 message: compactConnectorValidationMessage(
@@ -602,6 +621,14 @@ function registerIpc({ logger, stateStore }) {
       )),
       accounts,
     };
+    })();
+    accountValidationPromise = validation;
+    try {
+      return await validation;
+    } finally {
+      if (accountValidationPromise === validation) accountValidationPromise = null;
+      if (accountValidationAbortController === controller) accountValidationAbortController = null;
+    }
   });
   handle("launcher:browser-logout", async () => {
     const browser = await browserHost.logout();
@@ -792,6 +819,7 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.addWorkspace(input || {});
     await browserHost?.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
     return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
   });
@@ -807,6 +835,7 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.addAccount(input || {});
     await browserHost?.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
     return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
   });
@@ -814,6 +843,7 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.setAccountCredentials(input || {});
     await browserHost?.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
     return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
   });
@@ -821,6 +851,7 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.removeAccount(slotId);
     await browserHost?.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
     return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
   });
@@ -828,6 +859,7 @@ function registerIpc({ logger, stateStore }) {
     const result = await runtimeHost.removeAccountRecord(input || {});
     await browserHost?.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
     return { ok: true, stdout: result.stdout, accounts: runtimeHost.listAccounts() };
   });
@@ -927,6 +959,9 @@ async function requestQuit() {
   }
   shutdownInProgress = true;
   try {
+    accountValidationAbortController?.abort();
+    await runtimeHost?.cancelAccountValidation();
+    await accountValidationPromise?.catch(() => {});
     const activeOperation = runtimeHost?.currentOperation() || browserHost?.currentOperation();
     if (activeOperation) {
       throw new Error(`Wait for ${activeOperation} to finish before quitting Codex Web GPT`);
@@ -1068,6 +1103,7 @@ async function start() {
   try {
     await browserHost.syncAccountKeepalives(
       (runtimeHost.listAccounts().accounts || []).flatMap((account) => account.workspaces || []).map((slot) => slot.partition),
+      runtimeHost.hasRotationWorkspaces(),
     );
   } catch (error) {
     logger.warn("browser.account_keepalive_sync_failed", {
@@ -1092,7 +1128,7 @@ async function start() {
   const trayAvailable = createTray(logger);
   if (startHidden && !trayAvailable) mainWindow.once("ready-to-show", () => showMainWindow());
   const launcherSmokeTest = process.argv.includes("--launcher-smoke-test");
-  if (!launcherSmokeTest) {
+  if (!launcherSmokeTest && !runtimeHost.hasRotationWorkspaces()) {
     void browserHost.refreshAuthentication().catch((error) => {
       logger.warn("browser.session_refresh_failed", {
         message: error instanceof Error ? error.message : String(error),

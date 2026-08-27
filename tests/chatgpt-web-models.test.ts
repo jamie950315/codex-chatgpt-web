@@ -200,4 +200,51 @@ describe("fixed ChatGPT Web model routes", () => {
     expect(request.modelId).toBe(CHATGPT_WEB_LUNA_BACKEND_MODEL);
     expect(request.options.reasoning).toBe("low");
   });
+
+  test("maps Provider Sol aliases from the requested reasoning effort while preserving internal routes", () => {
+    const config = defaultConfig("browser-only");
+    for (const [effort, expectedSlug, expectedAdapterEffort] of [
+      ["low", "chatgpt-web/light", "low"],
+      ["medium", "chatgpt-web/medium", "medium"],
+      ["high", "chatgpt-web/high", "high"],
+    ] as const) {
+      const request = parsed("gpt-5.6-sol", effort);
+      const route = routeChatGptWebRequest(request, config, true);
+      expect(route.slug).toBe(expectedSlug);
+      expect(request.modelId).toBe(CHATGPT_WEB_BACKEND_MODEL);
+      expect(request.options.reasoning).toBe(expectedAdapterEffort);
+    }
+
+    expect(routeChatGptWebRequest(parsed("chatgpt-web/high", "low"), config, true).slug)
+      .toBe("chatgpt-web/high");
+  });
+
+  test("keeps Provider Sol Pro efforts gated and rejects unsupported standard model aliases", () => {
+    const plus = defaultConfig("browser-only");
+    expect(() => routeChatGptWebRequest(parsed("gpt-5.6-sol", "xhigh"), plus, true))
+      .toThrow("Extra High is not available for this account");
+    expect(() => routeChatGptWebRequest(parsed("gpt-5.6-sol", "max"), plus, true))
+      .toThrow("Pro is not available for this account");
+    expect(() => routeChatGptWebRequest(parsed("gpt-5.6-terra", "medium"), plus, true))
+      .toThrow("model is not enabled");
+
+    const proConfig = defaultConfig("full");
+    proConfig.proAvailable = true;
+    expect(routeChatGptWebRequest(parsed("gpt-5.6-sol", "xhigh"), proConfig, true).slug)
+      .toBe("chatgpt-web/extra-high");
+    expect(routeChatGptWebRequest(parsed("gpt-5.6-sol", "max"), proConfig, true).slug)
+      .toBe("chatgpt-web/pro");
+  });
+
+  test("maps the Provider Luna alias only for Luna-only accounts", () => {
+    const free = defaultConfig("browser-only");
+    free.solAvailable = false;
+    const request = parsed("gpt-5.6-luna", "high");
+    expect(routeChatGptWebRequest(request, free, true)).toBe(CHATGPT_WEB_LUNA_MODEL_ROUTE);
+    expect(request.modelId).toBe(CHATGPT_WEB_LUNA_BACKEND_MODEL);
+    expect(request.options.reasoning).toBe("low");
+
+    expect(() => routeChatGptWebRequest(parsed("gpt-5.6-luna", "low"), defaultConfig("full"), true))
+      .toThrow("only available for Luna-only accounts");
+  });
 });

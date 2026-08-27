@@ -67,6 +67,9 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
   const destroy = electronMain.indexOf("browserHost?.destroy()", persist);
   assert.ok(persist >= 0, "shutdown must persist the ChatGPT session");
   assert.ok(destroy > persist, "browser views must close only after session persistence completes");
+  assert.match(electronMain, /await runtimeHost\?\.cancelAccountValidation\(\)/);
+  assert.match(electronMain, /accountValidationAbortController\?\.abort\(\)/);
+  assert.match(electronMain, /await accountValidationPromise\?\.catch/);
 });
 
 test("DEV launcher exposes its profile and supervises only its Full-mode MCP runtime", () => {
@@ -126,11 +129,16 @@ test("Provider controls expose safe status and clipboard-only key operations", (
   assert.match(preloadSource, /copyProviderKey:[\s\S]*?launcher:provider-copy-key/);
   assert.match(preloadSource, /rotateProviderKey:[\s\S]*?launcher:provider-rotate-key/);
   assert.match(electronMain, /provider:\s*providerController\.status\(\)/);
+  assert.match(electronMain, /hasSignedInRotationWorkspace\(\)/);
   assert.match(settingsSource, /snapshot\.provider/);
   assert.match(settingsSource, /api!\.setupProvider\(\)/);
   assert.match(settingsSource, /api!\.copyProviderKey\(\)/);
   assert.match(settingsSource, /api!\.rotateProviderKey\(\)/);
   assert.doesNotMatch(preloadSource, /readProviderKey/);
+});
+
+test("rotation-only startup never refreshes the legacy base ChatGPT session", () => {
+  assert.match(electronMain, /if \(!launcherSmokeTest && !runtimeHost\.hasRotationWorkspaces\(\)\)[\s\S]*?browserHost\.refreshAuthentication\(\)/);
 });
 
 test("MCP verification failures stay inside the structured setup report", () => {

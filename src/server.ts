@@ -19,12 +19,16 @@ import {
 } from "./codex-integration";
 import {
   availableChatGptWebModelRoutes,
+  availableChatGptWebProviderModelIds,
   CHATGPT_WEB_LUNA_BACKEND_MODEL,
   isChatGptWebModelSlug,
+  isChatGptWebProviderModelId,
   requireChatGptWebModelRoute,
+  requireChatGptWebProviderModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
 import { forwardNativeCodexRequest, type NativeFetch } from "./native-passthrough";
+import { startCockpitProviderModelCatalogSync } from "./provider-model-catalog-sync";
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
@@ -192,15 +196,21 @@ function xmlText(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+function hasNativeCodexTurnMetadata(body: Record<string, unknown>): boolean {
+  const clientMetadata = body.client_metadata;
+  return Boolean(clientMetadata
+    && typeof clientMetadata === "object"
+    && !Array.isArray(clientMetadata)
+    && (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"] !== undefined);
+}
+
 function providerCompatibleRequest(raw: unknown, config: AppConfig): unknown {
   if (!config.providerApi?.enabled) return raw;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("Provider request body must be a JSON object");
   }
   const body = raw as Record<string, unknown>;
-  const clientMetadata = body.client_metadata;
-  if (clientMetadata && typeof clientMetadata === "object" && !Array.isArray(clientMetadata)
-    && (clientMetadata as Record<string, unknown>)["x-codex-turn-metadata"] !== undefined) {
+  if (hasNativeCodexTurnMetadata(body)) {
     return raw;
   }
   const metadata = body.metadata;
@@ -260,6 +270,15 @@ function providerCompatibleRequest(raw: unknown, config: AppConfig): unknown {
   };
 }
 
+function isCockpitProviderConnectionTest(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const body = raw as Record<string, unknown>;
+  if (hasNativeCodexTurnMetadata(body)) return false;
+  const metadata = body.metadata;
+  return Boolean(metadata && typeof metadata === "object" && !Array.isArray(metadata)
+    && (metadata as Record<string, unknown>).agtools_source === "codex_model_provider_batch_test");
+}
+
 type ChatGptWebAdapterFactory = (provider: CodexProviderConfig) => ProviderAdapter;
 
 export interface ResponseRequestOptions {
@@ -271,8 +290,14 @@ export interface ResponseRequestOptions {
   liveConfigPath?: string;
 }
 
-export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
-  const route = requireChatGptWebModelRoute(parsed.modelId, config);
+export function routeChatGptWebRequest(
+  parsed: CodexParsedRequest,
+  config: AppConfig,
+  allowProviderAliases = false,
+): ChatGptWebModelRoute {
+  const route = allowProviderAliases
+    ? requireChatGptWebProviderModelRoute(parsed.modelId, parsed.options.reasoning, config)
+    : requireChatGptWebModelRoute(parsed.modelId, config);
   parsed.modelId = route.backendModel;
   // A Pro task remains Pro, but its isolated summarization turn does not benefit from Pro's much
   // slower reasoning. Extra High has the same 95k pre-compaction budget on a Pro account, so it
@@ -294,8 +319,8 @@ export async function modelsRequest(
     if (authorizationError) return authorizationError;
     return Response.json({
       object: "list",
-      data: availableChatGptWebModelRoutes(config).map(route => ({
-        id: route.slug,
+      data: availableChatGptWebProviderModelIds().map(modelId => ({
+        id: modelId,
         object: "model",
         owned_by: "chatgpt-web",
       })),
@@ -372,14 +397,19 @@ export async function responseRequest(
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
+  const allowProviderAlias = config.providerApi?.enabled === true
+    && isCockpitProviderConnectionTest(raw);
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
     if (config.providerApi?.enabled) {
-      return formatErrorResponse(400, "invalid_request_error", `Provider model not found: ${requestedModel}`);
-    }
-    try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
-    } catch (error) {
-      return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+      if (!allowProviderAlias || !isChatGptWebProviderModelId(requestedModel)) {
+        return formatErrorResponse(400, "invalid_request_error", `Provider model not found: ${requestedModel}`);
+      }
+    } else {
+      try {
+        return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
+      } catch (error) {
+        return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
+      }
     }
   }
   const requestedPreviousResponseId = raw && typeof raw === "object" && !Array.isArray(raw)
@@ -395,7 +425,7 @@ export async function responseRequest(
   let route: ChatGptWebModelRoute;
   try {
     parsed = parseRequest(expanded);
-    route = routeChatGptWebRequest(parsed, config);
+    route = routeChatGptWebRequest(parsed, config, allowProviderAlias);
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
@@ -481,7 +511,12 @@ export async function responseRequest(
     }
   };
   const maps = toolBridgeMaps(parsed);
-  const responseModel = route.slug;
+  const responseModel = allowProviderAlias
+    && typeof requestedModel === "string"
+    && isChatGptWebProviderModelId(requestedModel)
+    && !isChatGptWebModelSlug(requestedModel)
+    ? requestedModel
+    : route.slug;
 
   if (parsed.stream) {
     void run();
@@ -568,6 +603,9 @@ export async function compactRequest(
     return formatErrorResponse(400, "invalid_request_error", "Compaction request requires a model");
   }
   if (!isChatGptWebModelSlug(raw.model)) {
+    if (config.providerApi?.enabled) {
+      return formatErrorResponse(400, "invalid_request_error", `Provider model not found: ${raw.model}`);
+    }
     try {
       return await forwardNativeCodexRequest(nativeRequest, "responses/compact", undefined, raw);
     } catch (error) {
@@ -656,6 +694,15 @@ export function startServer(
   }
   let draining = false;
   let shutdownPromise: Promise<void> | undefined;
+  const stopProviderCatalogSync = config.providerApi?.enabled
+    ? startCockpitProviderModelCatalogSync(config, {
+      onError(error) {
+        console.error(
+          `[codex-chatgpt-web] Cockpit model catalog sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    })
+    : undefined;
   let successfulModelCatalogRequests = 0;
   let lastSuccessfulModelCatalogRequestAt: string | null = null;
   const httpTurns = new HttpTurnCounter();
@@ -819,9 +866,15 @@ export function startServer(
       return new Response("Not found", { status: 404 });
     },
   });
+  const stopServer = server.stop.bind(server);
+  server.stop = ((closeActiveConnections?: boolean) => {
+    stopProviderCatalogSync?.();
+    return stopServer(closeActiveConnections);
+  }) as typeof server.stop;
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
+    stopProviderCatalogSync?.();
     chatGptTurnSessions.clear();
     flushResponseState();
     shutdownPromise = (async () => {

@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
 import type { ProviderAdapter } from "../src/adapters/base";
 import { defaultConfig } from "../src/config";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { COMPACT_PROMPT, SUMMARY_PREFIX, decodeCompactionSummary } from "../src/responses/compaction";
 import { compactRequest, responseRequest } from "../src/server";
 import type { CodexProviderConfig } from "../src/types";
@@ -198,6 +201,37 @@ test("rejects an unknown routed compact model instead of treating it as ChatGPT 
   expect(response.status).toBe(400);
   const body = await response.json() as { error: { message: string } };
   expect(body.error.message).toContain("model is not enabled");
+});
+
+test("Provider compaction rejects native models without forwarding its local Bearer key", async () => {
+  const root = mkdtempSync(join(tmpdir(), "provider-compact-isolation-"));
+  const keyFile = join(root, "provider-api.key");
+  const providerKey = "provider_compaction_secret_0123456789abcdefghijklmnopqrstuvwxyz";
+  writeFileSync(keyFile, `${providerKey}\n`, { mode: 0o600 });
+  const config = defaultConfig("full");
+  config.providerApi = { enabled: true, apiKeyFile: keyFile };
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls += 1;
+    return new Response("unexpected upstream request", { status: 500 });
+  }) as unknown as typeof fetch;
+  try {
+    const response = await compactRequest(new Request("http://127.0.0.1:17841/v1/responses/compact", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${providerKey}`,
+      },
+      body: JSON.stringify({ model: "gpt-5.6-sol", input: [] }),
+    }), config);
+
+    expect(response.status).toBe(400);
+    expect(upstreamCalls).toBe(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Luna rejects separate native compaction instead of opening another browser turn", async () => {

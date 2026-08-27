@@ -166,6 +166,35 @@ export function atomicWriteFile(path: string, data: string | Uint8Array): void {
   try { chmodSync(path, 0o600); } catch { /* Windows ACLs are managed by the installer. */ }
 }
 
+export function atomicWriteFileIfUnchanged(
+  path: string,
+  data: string | Uint8Array,
+  expected: string | Uint8Array,
+): boolean {
+  const directory = dirname(path);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  try { chmodSync(directory, 0o700); } catch { /* Windows ACLs are managed by the installer. */ }
+  const temp = `${path}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  const fd = openSync(temp, "wx", 0o600);
+  try {
+    writeFileSync(fd, data);
+    closeSync(fd);
+    const current = readFileSync(path);
+    const expectedBytes = typeof expected === "string" ? Buffer.from(expected) : Buffer.from(expected);
+    if (!current.equals(expectedBytes)) {
+      rmSync(temp, { force: true });
+      return false;
+    }
+    renameAtomicFile(temp, path);
+  } catch (error) {
+    try { closeSync(fd); } catch {}
+    rmSync(temp, { force: true });
+    throw error;
+  }
+  try { chmodSync(path, 0o600); } catch { /* Windows ACLs are managed by the installer. */ }
+  return true;
+}
+
 export function stripUtf8Bom(text: string): string {
   return text.startsWith("\uFEFF") ? text.slice(1) : text;
 }

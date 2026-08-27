@@ -77,6 +77,20 @@ const CHATGPT_VIEWPORT_CSS = `
 `;
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function abortable(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error("Account validation was cancelled"));
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(new Error("Account validation was cancelled"));
+    const cleanup = () => signal.removeEventListener("abort", aborted);
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve(promise).then(
+      value => { cleanup(); resolve(value); },
+      error => { cleanup(); reject(error); },
+    );
+  });
+}
 function withIdentity(snapshot, identity) {
   if (identity?.email || identity?.workspaceName) return { ...snapshot, identity };
   return snapshot;
@@ -97,6 +111,21 @@ function visibleElementScript(selector) {
 
 function isChatGptExpiredSessionText(text) {
   return CHATGPT_EXPIRED_SESSION_PATTERN.test(String(text || ""));
+}
+
+function validateSessionInspectionResult(result, detectCapabilities) {
+  const inspected = result?.value;
+  if (!inspected || inspected.authenticated !== true || inspected.temporary !== true || typeof inspected.url !== "string") {
+    throw new Error("Browser helper returned invalid ChatGPT session evidence");
+  }
+  if (detectCapabilities
+    && (typeof inspected.solAvailable !== "boolean" || typeof inspected.proAvailable !== "boolean")) {
+    throw new Error("Browser helper returned incomplete ChatGPT capability evidence");
+  }
+  if (detectCapabilities && inspected.proAvailable && !inspected.solAvailable) {
+    throw new Error("Browser helper returned contradictory ChatGPT capability evidence");
+  }
+  return inspected;
 }
 
 function expiredSessionElementScript() {
@@ -134,6 +163,7 @@ function probeChatGptAuthentication(contents) {
     };
     const initialSurface = readSurface();
     let sessionAuthenticated = false;
+    let sessionApiExpired = false;
     if (new URL(initialSurface.url).origin === expectedUrl.origin) {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), ${CHATGPT_AUTH_SESSION_TIMEOUT_MS});
@@ -161,15 +191,17 @@ function probeChatGptAuthentication(contents) {
           : typeof payload.expires === "string"
             && Number.isFinite(Date.parse(payload.expires))
             && Date.parse(payload.expires) > Date.now();
+        sessionApiExpired = payload !== null && (!sessionHasNoError || !sessionExpiryIsValid);
         sessionAuthenticated = sessionHasUser
           && sessionHasNoError
           && sessionExpiryIsValid;
       } catch {}
       finally { clearTimeout(timeout); }
     }
-    return { ...readSurface(), sessionAuthenticated };
+    return { ...readSurface(), sessionAuthenticated, sessionApiExpired };
   })()`, true).then((result) => ({
     ...result,
+    sessionExpired: Boolean(result.sessionExpired || result.sessionApiExpired),
     authenticated: Boolean(
       !result.sessionExpired
       && result.composer
@@ -181,6 +213,7 @@ function probeChatGptAuthentication(contents) {
     composer: false,
     temporary: false,
     sessionAuthenticated: false,
+    sessionApiExpired: false,
     sessionExpired: false,
     readyState: "unknown",
     authenticated: false,
@@ -396,6 +429,7 @@ class BrowserHost {
     this.visible = false;
     this.surfaceActive = true;
     this.keepaliveViews = new Map();
+    this.rotationConfigured = false;
     this.keepaliveTimer = null;
     this.turnTabs = new Map();
     this.closedTurnOwners = new Map();
@@ -511,12 +545,15 @@ class BrowserHost {
     return view;
   }
 
-  async syncAccountKeepalives(partitions = []) {
+  async syncAccountKeepalives(partitions = [], rotationConfigured) {
     const wanted = new Set(
       (Array.isArray(partitions) ? partitions : []).filter((value) => (
         typeof value === "string" && value.startsWith("persist:codex-web-gpt-") && value !== this.partition
       )),
     );
+    this.rotationConfigured = typeof rotationConfigured === "boolean"
+      ? rotationConfigured
+      : wanted.size > 0;
     for (const partition of wanted) this.ensureKeepalivePartition(partition);
     const retired = [];
     for (const [partition, view] of this.keepaliveViews) {
@@ -1802,17 +1839,18 @@ class BrowserHost {
     return await this.withManualOperation("connector verification", () => this.runConnectorVerification(appName));
   }
 
-  async runConnectorVerification(appName, partition) {
+  async runConnectorVerification(appName, partition, abortSignal) {
     const connectorName = validateConnectorName(appName);
     this.setState({ status: "testing", message: "Checking ChatGPT connector" });
     const extra = partition && partition !== this.partition;
     if (!extra) {
-      await this.refreshChatGptHomeDocument();
+      await abortable(this.refreshChatGptHomeDocument(), abortSignal);
       const result = await this.verifyConnectorWithBrowserHelper({
         helper: this.helper,
         descriptorPath: this.descriptorPath,
         appName: connectorName,
         logger: this.logger,
+        ...(abortSignal ? { abortSignal } : {}),
       });
       this.logger.info("connector.verified", { appName: connectorName });
       this.setState({ status: "ready", message: "ChatGPT connector is available", authenticated: true });
@@ -1825,33 +1863,34 @@ class BrowserHost {
       view.webContents.setBackgroundThrottling(false);
     }
     try {
-      await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+      await abortable(view.webContents.loadURL(TEMPORARY_CHAT_URL), abortSignal);
       const deadline = Date.now() + 60_000;
       while (Date.now() < deadline) {
         const current = view.webContents.getURL();
         if (current.startsWith(CHATGPT_ORIGIN) && !current.includes("/auth")) break;
-        await sleep(500);
+        await abortable(sleep(500), abortSignal);
       }
       const signedInUrl = view.webContents.getURL();
       if (!signedInUrl.startsWith(CHATGPT_ORIGIN) || signedInUrl.includes("/auth")) {
         throw new Error("Not signed in to ChatGPT on this workspace");
       }
-      await sleep(400);
+      await abortable(sleep(400), abortSignal);
       if (!view.webContents.isDestroyed()) view.webContents.focus();
       const surfaceId = randomBytes(24).toString("base64url");
       const encoded = JSON.stringify(surfaceId);
-      await view.webContents.executeJavaScript(`(() => {
+      await abortable(view.webContents.executeJavaScript(`(() => {
         Object.defineProperty(globalThis, "__CODEX_WEB_GPT_SURFACE_ID__", {
           value: ${encoded}, configurable: true, enumerable: false, writable: true,
         });
         document.documentElement.dataset.codexWebGptSurface = ${encoded};
-      })()`, true);
+      })()`, true), abortSignal);
       const result = await this.verifyConnectorWithBrowserHelper({
         helper: this.helper,
         descriptorPath: this.descriptorPath,
         appName: connectorName,
         logger: this.logger,
         surfaceId,
+        ...(abortSignal ? { abortSignal } : {}),
       });
       this.logger.info("connector.verified", { appName: connectorName, partition });
       this.setState({ status: "ready", message: "ChatGPT connector is available" });
@@ -1861,17 +1900,17 @@ class BrowserHost {
     }
   }
 
-  async probePartitionLogin(partition) {
+  async probePartitionLogin(partition, abortSignal) {
     const extra = partition && partition !== this.partition;
     const view = extra ? this.ensureKeepalivePartition(partition) : this.view;
     if (!view || view.webContents.isDestroyed()) {
       return { status: "error", message: "ChatGPT browser surface is unavailable" };
     }
     if (!String(view.webContents.getURL()).startsWith(CHATGPT_ORIGIN)) {
-      await view.webContents.loadURL(TEMPORARY_CHAT_URL);
-      await sleep(1500);
+      await abortable(view.webContents.loadURL(TEMPORARY_CHAT_URL), abortSignal);
+      await abortable(sleep(1500), abortSignal);
     }
-    const authentication = await probeChatGptAuthentication(view.webContents);
+    const authentication = await abortable(probeChatGptAuthentication(view.webContents), abortSignal);
     if (authentication.sessionExpired) {
       return {
         status: "error",
@@ -1890,6 +1929,59 @@ class BrowserHost {
   }
 
   async runSessionInspection(detectCapabilities = false) {
+    const configuredWorkspaces = detectCapabilities ? [...(this.keepaliveViews || new Map())] : [];
+    if (detectCapabilities && (this.rotationConfigured === true || configuredWorkspaces.length > 0)) {
+      const liveWorkspaces = configuredWorkspaces
+        .filter(([, view]) => view && !view.webContents.isDestroyed());
+      if (liveWorkspaces.length === 0) {
+        throw new Error("No configured rotation workspace browser is available for capability inspection");
+      }
+      const connectorName = this.connectorName();
+      const failures = [];
+      for (const [partition, view] of liveWorkspaces) {
+        view.setBounds({ ...this.hiddenTurnBounds(), x: -1600 });
+        view.setVisible(true);
+        view.webContents.setBackgroundThrottling(false);
+        try {
+          await view.webContents.loadURL(TEMPORARY_CHAT_URL);
+          const deadline = Date.now() + 60_000;
+          while (Date.now() < deadline) {
+            const current = view.webContents.getURL();
+            if (current.startsWith(CHATGPT_ORIGIN) && !current.includes("/auth")) break;
+            await sleep(500);
+          }
+          const signedInUrl = view.webContents.getURL();
+          if (!signedInUrl.startsWith(CHATGPT_ORIGIN) || signedInUrl.includes("/auth")) {
+            throw new Error("Not signed in to ChatGPT on this workspace");
+          }
+          await sleep(400);
+          if (!view.webContents.isDestroyed()) view.webContents.focus();
+          const surfaceId = randomBytes(24).toString("base64url");
+          const encoded = JSON.stringify(surfaceId);
+          await view.webContents.executeJavaScript(`(() => {
+            Object.defineProperty(globalThis, "__CODEX_WEB_GPT_SURFACE_ID__", {
+              value: ${encoded}, configurable: true, enumerable: false, writable: true,
+            });
+            document.documentElement.dataset.codexWebGptSurface = ${encoded};
+          })()`, true);
+          const result = await this.runBrowserHelperOperation({
+            helper: this.helper,
+            descriptorPath: this.descriptorPath,
+            appName: connectorName,
+            operation: "inspect",
+            payload: { detectCapabilities },
+            logger: this.logger,
+            surfaceId,
+          });
+          return validateSessionInspectionResult(result, detectCapabilities);
+        } catch (error) {
+          failures.push(`${partition}: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+          this.hideKeepaliveView(view);
+        }
+      }
+      throw new Error(`No configured rotation workspace passed capability inspection: ${failures.join("; ")}`);
+    }
     const connectorName = this.connectorName();
     const initialUrl = this.view.webContents.getURL();
     const startedIdle = initialUrl === IDLE_BROWSER_URL;
@@ -1902,17 +1994,7 @@ class BrowserHost {
       payload: { detectCapabilities },
       logger: this.logger,
     });
-    const inspected = result?.value;
-    if (!inspected || inspected.authenticated !== true || inspected.temporary !== true || typeof inspected.url !== "string") {
-      throw new Error("Browser helper returned invalid ChatGPT session evidence");
-    }
-    if (detectCapabilities
-      && (typeof inspected.solAvailable !== "boolean" || typeof inspected.proAvailable !== "boolean")) {
-      throw new Error("Browser helper returned incomplete ChatGPT capability evidence");
-    }
-    if (detectCapabilities && inspected.proAvailable && !inspected.solAvailable) {
-      throw new Error("Browser helper returned contradictory ChatGPT capability evidence");
-    }
+    const inspected = validateSessionInspectionResult(result, detectCapabilities);
     if (startedIdle) await this.returnToIdle();
     return inspected;
   }

@@ -161,7 +161,7 @@ test("Provider key copy and rotation keep the secret out of ordinary status", ()
   }
 });
 
-test("Provider setup rollback checkpoint excludes Codex route and catalog files", () => {
+test("Provider setup rollback includes its catalog while excluding the managed Codex route", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-provider-checkpoint-"));
   try {
     const fixture = hostFor({ mode: "browser-only" });
@@ -173,13 +173,125 @@ test("Provider setup rollback checkpoint excludes Codex route and catalog files"
       "provider",
     ).map(item => item.path);
     assert.equal(paths.includes(path.join(root, "codex", "config.toml")), false);
-    assert.equal(paths.includes(path.join(root, "codex", "models_cache.json")), false);
+    assert.equal(paths.includes(path.join(root, "codex", "cockpit-local-access-model-catalog.json")), true);
+    assert.equal(paths.includes(path.join(root, "codex", "cockpit-model-catalog.json")), true);
+    assert.equal(paths.includes(path.join(root, "codex", "models_cache.json")), true);
     assert.equal(paths.some(item => item.includes("integration-journal")), false);
     assert.equal(paths.includes(path.join(root, "app", "config.json")), true);
     assert.equal(paths.includes(path.join(root, "app", "secrets", "provider-api.key")), true);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Provider checkpoint restoration preserves a Cockpit catalog changed after setup", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-web-gpt-provider-concurrent-"));
+  try {
+    const fixture = hostFor({ mode: "browser-only" });
+    fixture.host.supervisor.configPath = path.join(root, "app", "config.json");
+    fixture.host.supervisor.coreHome = path.join(root, "app");
+    fixture.host.codexHome = path.join(root, "codex");
+    const catalogPath = path.join(root, "codex", "cockpit-local-access-model-catalog.json");
+    fs.mkdirSync(path.dirname(catalogPath), { recursive: true });
+    fs.writeFileSync(catalogPath, "original\n");
+    const checkpoint = fixture.host.captureSetupCheckpoint(
+      fixture.host.runtimeConfigSnapshot(),
+      "provider",
+    );
+    fs.writeFileSync(catalogPath, "setup result\n");
+    const postSetup = fixture.host.captureSetupCheckpointPostState(checkpoint);
+    fs.writeFileSync(catalogPath, "cockpit concurrent update\n");
+
+    fixture.host.restoreSetupCheckpoint(checkpoint, postSetup);
+
+    assert.equal(fs.readFileSync(catalogPath, "utf8"), "cockpit concurrent update\n");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runSetup automatically uses Provider checkpoint scope for every provider-mode entrypoint", async () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    browserHost: "launcher",
+    providerApi: { enabled: true },
+  });
+  let capturedScope;
+  fixture.host.captureSetupCheckpoint = (_snapshot, scope) => {
+    capturedScope = scope;
+    return [];
+  };
+  fixture.host.supervisor.stopForSetup = async () => {};
+  fixture.host.supervisor.startIfConfigured = async () => ({ status: "ready" });
+  fixture.host.run = async () => ({ code: 0, stdout: "", stderr: "" });
+
+  await RuntimeHost.prototype.runSetup.call(
+    fixture.host,
+    "provider-operation",
+    ["setup", "--provider-mode"],
+    {},
+  );
+
+  assert.equal(capturedScope, "provider");
+});
+
+test("rotation workspace authentication is independent from the legacy base session", () => {
+  const fixture = hostFor({
+    mode: "browser-only",
+    accountRotation: {
+      enabled: true,
+      credentials: [],
+      accounts: [{ id: "account_a", name: "A", credentialId: "primary" }],
+      slots: [{
+        id: "slot_a",
+        accountId: "account_a",
+        credentialId: "primary",
+        label: "Workspace A",
+        signedIn: true,
+        storageStatePath: "/tmp/slot-a.json",
+      }],
+    },
+  });
+
+  assert.equal(fixture.host.hasRotationWorkspaces(), true);
+  assert.equal(fixture.host.hasSignedInRotationWorkspace(), true);
+});
+
+test("read-only account validation does not queue workspace mutations", async () => {
+  const fixture = hostFor(null);
+  fixture.host.command = (args) => ({
+    executable: process.execPath,
+    args: args[0] === "accounts" && args[1] === "validate"
+      ? ["-e", "setTimeout(() => process.stdout.write('{}'), 300)"]
+      : ["-e", "process.stdout.write('{}')"],
+    cwd: process.cwd(),
+  });
+
+  const validation = fixture.host.validateAccounts();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  const mutation = fixture.host.renameWorkspace({ id: "slot_a", name: "Renamed" });
+  const winner = await Promise.race([
+    mutation.then(() => "mutation"),
+    validation.then(() => "validation"),
+  ]);
+
+  assert.equal(winner, "mutation");
+  await validation;
+});
+
+test("account validation can be cancelled for launcher shutdown", async () => {
+  const fixture = hostFor(null);
+  fixture.host.command = () => ({
+    executable: process.execPath,
+    args: ["-e", "setTimeout(() => process.stdout.write('{}'), 30000)"],
+    cwd: process.cwd(),
+  });
+
+  const validation = fixture.host.validateAccounts();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(await fixture.host.cancelAccountValidation(), true);
+  assert.equal(fixture.host.validationChild, null);
+  await validation;
 });
 
 test("DEV core setup configures only the isolated harness contract", async () => {

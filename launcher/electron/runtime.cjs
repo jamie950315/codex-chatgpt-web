@@ -48,6 +48,23 @@ function collect(stream, chunks, onLine, onError) {
   stream.on("error", (error) => onError?.(error));
 }
 
+function waitForChildExit(child, timeoutMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
 function resolveUserPath(value) {
   if (value === "~") return os.homedir();
   if (value.startsWith("~/") || value.startsWith("~\\")) {
@@ -174,6 +191,7 @@ class RuntimeHost {
     this.supervisor = supervisor;
     this.active = null;
     this.activeChild = null;
+    this.validationChild = null;
     this.lifecycleOperation = null;
     this.runQueue = Promise.resolve();
     this.cleanupEphemeralSecrets();
@@ -186,6 +204,20 @@ class RuntimeHost {
     return this.lifecycleOperation || this.active || (stuckChild ? "previous runtime process shutdown" : null);
   }
 
+  async cancelAccountValidation() {
+    const child = this.validationChild;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return false;
+    terminateOwnedProcessTree(child);
+    if (!await waitForChildExit(child, 2_000)) {
+      terminateOwnedProcessTree(child, "SIGKILL");
+      if (!await waitForChildExit(child, 2_000)) {
+        throw new Error("Account validation process did not exit after forced termination");
+      }
+    }
+    if (this.validationChild === child) this.validationChild = null;
+    return true;
+  }
+
   assertProductionProfile(operation) {
     if (this.launcherProfile !== "production") {
       throw new Error(`${operation} is unavailable in the isolated DEV launcher profile`);
@@ -194,6 +226,17 @@ class RuntimeHost {
 
   providerModeConfigured() {
     return this.runtimeConfigSnapshot().config?.providerApi?.enabled === true;
+  }
+
+  hasRotationWorkspaces() {
+    return this.listAccounts().accounts
+      .some((account) => (account.workspaces || []).some((workspace) => workspace.id !== "primary"));
+  }
+
+  hasSignedInRotationWorkspace() {
+    return this.listAccounts().accounts
+      .some((account) => (account.workspaces || [])
+        .some((workspace) => workspace.id !== "primary" && workspace.signedIn === true));
   }
 
   providerStatus() {
@@ -360,6 +403,9 @@ class RuntimeHost {
     }
     if (scope === "provider") {
       paths.add(path.join(coreHome, "secrets", "provider-api.key"));
+      paths.add(path.join(this.codexHome, "cockpit-local-access-model-catalog.json"));
+      paths.add(path.join(this.codexHome, "cockpit-model-catalog.json"));
+      paths.add(path.join(this.codexHome, "models_cache.json"));
       const providerKeyFile = snapshot.config?.providerApi?.apiKeyFile;
       if (typeof providerKeyFile === "string" && path.isAbsolute(providerKeyFile)) {
         paths.add(providerKeyFile);
@@ -381,18 +427,38 @@ class RuntimeHost {
         paths.add(path.join(tunnel.profileDir, `${tunnel.profileName}.yaml`));
       }
     }
-    return [...paths].map(captureRegularFile);
+    const externalMutablePaths = scope === "provider"
+      ? new Set([
+        path.join(this.codexHome, "cockpit-local-access-model-catalog.json"),
+        path.join(this.codexHome, "cockpit-model-catalog.json"),
+        path.join(this.codexHome, "models_cache.json"),
+      ])
+      : new Set();
+    return [...paths].map((filePath) => ({
+      ...captureRegularFile(filePath),
+      externalMutable: externalMutablePaths.has(filePath),
+    }));
+  }
+
+  captureSetupCheckpointPostState(checkpoint) {
+    return new Map((checkpoint || [])
+      .filter(snapshot => snapshot.externalMutable)
+      .map(snapshot => [snapshot.path, captureRegularFile(snapshot.path)]));
   }
 
   setupCheckpointChanged(checkpoint) {
     return checkpoint ? checkpoint.some(snapshot => regularFileChanged(snapshot, this.platform)) : false;
   }
 
-  restoreSetupCheckpoint(checkpoint) {
+  restoreSetupCheckpoint(checkpoint, postSetupState) {
     if (!checkpoint) return;
     const failures = [];
     for (const snapshot of [...checkpoint].reverse()) {
       try {
+        if (snapshot.externalMutable) {
+          const expected = postSetupState?.get(snapshot.path);
+          if (!expected || regularFileChanged(expected, this.platform)) continue;
+        }
         restoreRegularFile(snapshot, this.platform);
       } catch (error) {
         failures.push(`${snapshot.path}: ${error instanceof Error ? error.message : String(error)}`);
@@ -446,7 +512,7 @@ class RuntimeHost {
     }
   }
 
-  async rollbackFirstSetup(checkpoint) {
+  async rollbackFirstSetup(checkpoint, postSetupState) {
     const changed = this.setupCheckpointChanged(checkpoint);
     let stopError;
     try {
@@ -456,7 +522,7 @@ class RuntimeHost {
     }
     let restoreError;
     try {
-      this.restoreSetupCheckpoint(checkpoint);
+      this.restoreSetupCheckpoint(checkpoint, postSetupState);
     } catch (error) {
       restoreError = error;
     }
@@ -479,18 +545,27 @@ class RuntimeHost {
   }
 
   async executeRun(name, args, options = {}) {
-    if (this.active) throw new Error(`Another launcher operation is active: ${this.active}`);
-    if (this.activeChild
+    const concurrentReadOnly = options.concurrentReadOnly === true;
+    if (!concurrentReadOnly && this.active) throw new Error(`Another launcher operation is active: ${this.active}`);
+    if (!concurrentReadOnly && this.activeChild
       && this.activeChild.exitCode === null
       && this.activeChild.signalCode === null) {
       throw new Error("A previous launcher operation process is still running");
     }
-    this.activeChild = null;
-    if (this.lifecycleOperation && this.lifecycleOperation !== name) {
+    if (concurrentReadOnly && this.validationChild
+      && this.validationChild.exitCode === null
+      && this.validationChild.signalCode === null) {
+      throw new Error("Account validation is already running");
+    }
+    if (concurrentReadOnly) this.validationChild = null;
+    else this.activeChild = null;
+    if (!concurrentReadOnly && this.lifecycleOperation && this.lifecycleOperation !== name) {
       throw new Error(`Another launcher operation is active: ${this.lifecycleOperation}`);
     }
-    this.active = name;
-    this.publishOperation?.({ name, status: "running", message: options.message || name });
+    if (!concurrentReadOnly) {
+      this.active = name;
+      this.publishOperation?.({ name, status: "running", message: options.message || name });
+    }
     this.logger.info("runtime.operation_started", { name, args: args.map((arg) => /key|token/i.test(arg) ? "[redacted]" : arg) });
     try {
       const invocation = options.embedded
@@ -511,7 +586,8 @@ class RuntimeHost {
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
-        this.activeChild = child;
+        if (concurrentReadOnly) this.validationChild = child;
+        else this.activeChild = child;
         const stdout = [];
         const stderr = [];
         const pipeErrors = [];
@@ -520,11 +596,11 @@ class RuntimeHost {
         };
         collect(child.stdout, stdout, (line) => {
           this.logger.info("runtime.stdout", { operation: name, line });
-          this.publishOperation?.({ name, status: "running", message: redactText(line) });
+          if (!concurrentReadOnly) this.publishOperation?.({ name, status: "running", message: redactText(line) });
         }, recordPipeError("stdout"));
         collect(child.stderr, stderr, (line) => {
           this.logger.warn("runtime.stderr", { operation: name, line });
-          this.publishOperation?.({ name, status: "running", message: redactText(line) });
+          if (!concurrentReadOnly) this.publishOperation?.({ name, status: "running", message: redactText(line) });
         }, recordPipeError("stderr"));
         let settled = false;
         let timedOut = null;
@@ -574,7 +650,9 @@ class RuntimeHost {
           const childStillRunning = Number.isInteger(child.pid)
             && child.exitCode === null
             && child.signalCode === null;
-          if (this.activeChild === child && !childStillRunning) this.activeChild = null;
+          if (concurrentReadOnly) {
+            if (this.validationChild === child && !childStillRunning) this.validationChild = null;
+          } else if (this.activeChild === child && !childStillRunning) this.activeChild = null;
           if (settled) return;
           settled = true;
           clearTimers();
@@ -583,7 +661,9 @@ class RuntimeHost {
             : error);
         });
         child.once("exit", (code, signal) => {
-          if (this.activeChild === child) this.activeChild = null;
+          if (concurrentReadOnly) {
+            if (this.validationChild === child) this.validationChild = null;
+          } else if (this.activeChild === child) this.activeChild = null;
           if (settled) return;
           settled = true;
           clearTimers();
@@ -616,15 +696,15 @@ class RuntimeHost {
         throw new Error(detail);
       }
       this.logger.info("runtime.operation_completed", { name });
-      this.publishOperation?.({ name, status: "completed", message: options.successMessage || "Completed" });
+      if (!concurrentReadOnly) this.publishOperation?.({ name, status: "completed", message: options.successMessage || "Completed" });
       return result;
     } catch (error) {
       const message = redactText(error instanceof Error ? error.message : String(error));
       this.logger.error("runtime.operation_failed", { name, message });
-      this.publishOperation?.({ name, status: "failed", message });
+      if (!concurrentReadOnly) this.publishOperation?.({ name, status: "failed", message });
       throw new Error(message);
     } finally {
-      this.active = null;
+      if (!concurrentReadOnly) this.active = null;
     }
   }
 
@@ -1215,10 +1295,11 @@ class RuntimeHost {
   }
 
   async validateAccounts() {
-    return this.run("accounts-validate", ["accounts", "validate"], {
+    return this.executeRun("accounts-validate", ["accounts", "validate"], {
       message: "Validating ChatGPT accounts",
       timeoutMs: 30_000,
       acceptedExitCodes: [0, 1],
+      concurrentReadOnly: true,
     });
   }
 
@@ -1334,14 +1415,18 @@ class RuntimeHost {
   async runSetup(name, args, options) {
     if (this.currentOperation()) throw new Error(`Another launcher operation is active: ${this.currentOperation()}`);
     const previousRuntime = this.runtimeConfigSnapshot();
-    const checkpoint = this.captureSetupCheckpoint(previousRuntime, options.checkpointScope);
+    const checkpointScope = options.checkpointScope
+      ?? (args.includes("--provider-mode") ? "provider" : undefined);
+    const checkpoint = this.captureSetupCheckpoint(previousRuntime, checkpointScope);
     this.lifecycleOperation = name;
     let setupCommandStarted = false;
+    let postSetupState;
     try {
       if (previousRuntime.owner === "external") this.supervisor.prepareExternalMigration();
       else await this.supervisor.stopForSetup();
       setupCommandStarted = true;
       const result = await this.run(name, args, options);
+      postSetupState = this.captureSetupCheckpointPostState(checkpoint);
       const runtime = await this.supervisor.startIfConfigured();
       if (runtime.status !== "ready") {
         throw new Error(`Setup completed, but the launcher-owned runtime is ${runtime.status}: ${runtime.detail || "not ready"}`);
@@ -1354,7 +1439,7 @@ class RuntimeHost {
       let checkpointChanged = false;
       if (!previousRuntime.configured && setupCommandStarted) {
         try {
-          rolledBack = await this.rollbackFirstSetup(checkpoint);
+          rolledBack = await this.rollbackFirstSetup(checkpoint, postSetupState);
         } catch (caught) {
           failures.push(
             `first-time setup rollback failed: ${caught instanceof Error ? caught.message : String(caught)}`,
@@ -1371,7 +1456,7 @@ class RuntimeHost {
           );
         }
         try {
-          this.restoreSetupCheckpoint(checkpoint);
+          this.restoreSetupCheckpoint(checkpoint, postSetupState);
         } catch (caught) {
           failures.push(caught instanceof Error ? caught.message : String(caught));
         }

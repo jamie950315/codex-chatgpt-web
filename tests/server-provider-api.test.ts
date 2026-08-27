@@ -27,7 +27,11 @@ function providerConfig() {
   return config;
 }
 
-function cockpitRequest(model = "chatgpt-web/high", authorization = `Bearer ${apiKey}`) {
+function cockpitRequest(
+  model = "chatgpt-web/high",
+  authorization = `Bearer ${apiKey}`,
+  reasoning = "medium",
+) {
   return new Request("http://127.0.0.1:17841/v1/responses", {
     method: "POST",
     headers: {
@@ -48,6 +52,7 @@ function cockpitRequest(model = "chatgpt-web/high", authorization = `Bearer ${ap
       store: false,
       stream: false,
       max_output_tokens: 256,
+      reasoning: { effort: reasoning },
       metadata: { agtools_source: "codex_model_provider_batch_test" },
     }),
   });
@@ -72,21 +77,64 @@ test("provider Responses requires the exact configured Bearer key before constru
   expect(adapters).toBe(0);
 });
 
-test("provider Responses rejects unknown models without native Codex passthrough", async () => {
-  let adapters = 0;
+test("provider Responses routes Cockpit's Sol model and reasoning without native Codex passthrough", async () => {
+  let observed: { modelId: string; reasoning?: string } | undefined;
   const response = await responseRequest(
-    cockpitRequest("gpt-5.6-sol"),
+    cockpitRequest("gpt-5.6-sol", `Bearer ${apiKey}`, "medium"),
     providerConfig(),
-    () => {
-      adapters += 1;
-      throw new Error("unknown provider model must not construct an adapter");
-    },
+    () => ({
+      name: "cockpit-sol-alias",
+      async runTurn(parsed, _incoming, emit) {
+        observed = { modelId: parsed.modelId, reasoning: parsed.options.reasoning };
+        emit({ type: "text_delta", text: "OK", phase: "final_answer" });
+        emit({ type: "done", stopReason: "stop", endTurn: true });
+      },
+    }),
   );
 
-  expect(response.status).toBe(400);
-  expect(await response.json()).toMatchObject({
-    error: { type: "invalid_request_error" },
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ model: "gpt-5.6-sol", status: "completed" });
+  expect(observed).toEqual({ modelId: "gpt-5.6-sol", reasoning: "medium" });
+});
+
+test("provider Responses rejects a native Sol alias outside Cockpit's connection test", async () => {
+  for (const source of ["ordinary_codex_request", "codex_model_provider_batch_test"]) {
+    const request = cockpitRequest("gpt-5.6-sol");
+    const body = await request.json() as any;
+    body.metadata = { agtools_source: source };
+    body.client_metadata = {
+      "x-codex-turn-metadata": JSON.stringify({
+        thread_id: "thread_native_sol",
+        turn_id: "turn_native_sol",
+        request_kind: "turn",
+        sandbox_mode: "read-only",
+        workspaces: { [process.cwd()]: { has_changes: false } },
+      }),
+    };
+    body.input[0].internal_chat_message_metadata_passthrough = { turn_id: "turn_native_sol" };
+    let adapters = 0;
+
+    const response = await responseRequest(new Request(request.url, {
+      method: "POST",
+      headers: request.headers,
+      body: JSON.stringify(body),
+    }), providerConfig(), () => {
+      adapters += 1;
+      throw new Error("native aliases must not construct a WebGPT adapter");
+    });
+
+    expect(response.status).toBe(400);
+    expect(adapters).toBe(0);
+  }
+});
+
+test("provider Responses still rejects unsupported standard model IDs", async () => {
+  let adapters = 0;
+  const response = await responseRequest(cockpitRequest("gpt-5.6-terra"), providerConfig(), () => {
+    adapters += 1;
+    throw new Error("unsupported provider model must not construct an adapter");
   });
+  expect(response.status).toBe(400);
   expect(adapters).toBe(0);
 });
 

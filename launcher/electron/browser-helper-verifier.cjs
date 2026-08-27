@@ -47,7 +47,17 @@ async function stopChild(child) {
   }
 }
 
-async function runBrowserHelperOperation({ helper, descriptorPath, appName, operation, payload = {}, logger, surfaceId }) {
+async function runBrowserHelperOperation({
+  helper,
+  descriptorPath,
+  appName,
+  operation,
+  payload = {},
+  logger,
+  surfaceId,
+  abortSignal,
+}) {
+  if (abortSignal?.aborted) throw new Error("Browser helper operation was cancelled");
   if (!helper || typeof helper.executable !== "string" || typeof helper.script !== "string") {
     throw new Error("Browser helper verification command is invalid");
   }
@@ -70,6 +80,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
   let completed = false;
   let sent = false;
   let timer;
+  let abortListener;
   const output = createInterface({ input: child.stdout });
   const errors = createInterface({ input: child.stderr });
   errors.on("line", (line) => logger?.info("browser.connector_helper", { message: line.slice(0, 2_000) }));
@@ -79,6 +90,7 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
       if (completed) return;
       completed = true;
       if (timer) clearTimeout(timer);
+      if (abortListener) abortSignal?.removeEventListener("abort", abortListener);
       if (error) reject(error);
       else resolve(value);
     };
@@ -141,6 +153,9 @@ async function runBrowserHelperOperation({ helper, descriptorPath, appName, oper
       () => finish(new Error(`Browser helper ${operation} timed out`)),
       BROWSER_HELPER_OPERATION_TIMEOUT_MS,
     );
+    abortListener = () => finish(new Error("Browser helper operation was cancelled"));
+    abortSignal?.addEventListener("abort", abortListener, { once: true });
+    if (abortSignal?.aborted) abortListener();
   });
 
   let value;
