@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -247,6 +247,90 @@ test("DEV browser-only setup persists only the isolated harness profile", async 
     });
     expect(existsSync(join(root, "production-codex", "config.toml"))).toBe(false);
     expect(existsSync(join(devHome, "codex-home", "config.toml"))).toBe(false);
+  } finally {
+    await new Promise<void>(resolveClose => control.close(() => resolveClose()));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("provider setup creates an owner-only API credential without changing the active Codex backend", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-provider-setup-"));
+  const appHome = join(root, "app");
+  const codexHome = join(root, "codex");
+  const descriptorPath = join(appHome, "runtime", "launcher-browser.json");
+  const helperScript = join(root, "helper.cjs");
+  const controlToken = "provider-launcher-control-token-0123456789abcdefghijkl";
+  const originalCodexConfig = 'openai_base_url = "http://127.0.0.1:57204/v1"\nmodel = "gpt-5.6-sol"\n';
+  const control = createServer(async (request, response) => {
+    for await (const _chunk of request) { /* consume the inspection request */ }
+    expect(request.url).toBe("/v1/session/inspect");
+    expect(request.headers.authorization).toBe(`Bearer ${controlToken}`);
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      authenticated: true,
+      temporary: true,
+      solAvailable: true,
+      proAvailable: true,
+      url: "https://chatgpt.com/?temporary-chat=true",
+    }));
+  });
+  await new Promise<void>((resolveListen, rejectListen) => {
+    control.once("error", rejectListen);
+    control.listen(0, "127.0.0.1", resolveListen);
+  });
+  try {
+    const address = control.address();
+    if (!address || typeof address === "string") throw new Error("control server has no port");
+    mkdirSync(join(appHome, "runtime"), { recursive: true });
+    mkdirSync(codexHome, { recursive: true });
+    writeFileSync(join(codexHome, "config.toml"), originalCodexConfig);
+    writeFileSync(helperScript, "module.exports = {};\n", { mode: 0o700 });
+    writeFileSync(descriptorPath, `${JSON.stringify({
+      version: 2,
+      kind: "codex-web-gpt-launcher",
+      profile: "production",
+      pid: process.pid,
+      endpoint: "http://127.0.0.1:48120",
+      control: { endpoint: `http://127.0.0.1:${address.port}`, token: controlToken },
+      helper: { executable: process.execPath, script: helperScript },
+      partition: "persist:codex-web-gpt-chatgpt",
+      idleUrl: "about:blank#codex-web-gpt-browser-host",
+      surfaceId: "p".repeat(32),
+      createdAt: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
+
+    const result = await runCli([
+      "setup",
+      "--browser-only",
+      "--provider-mode",
+      "--port",
+      String(20_000 + Math.floor(Math.random() * 20_000)),
+      "--browser-host-descriptor",
+      descriptorPath,
+      "--acknowledge-unofficial",
+    ], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+      CODEX_HOME: codexHome,
+    });
+
+    expect({ exitCode: result.exitCode, stderr: result.stderr }).toEqual({ exitCode: 0, stderr: "" });
+    expect(result.stdout).toContain("Provider API configured");
+    expect(result.stdout).not.toContain("Restart the Codex app");
+    expect(readFileSync(join(codexHome, "config.toml"), "utf8")).toBe(originalCodexConfig);
+    expect(existsSync(join(appHome, "codex", "integration-journal.json"))).toBe(false);
+    expect(existsSync(join(appHome, "codex", "integration-journal.recovery.json"))).toBe(false);
+    expect(existsSync(join(codexHome, "models_cache.json"))).toBe(false);
+    const config = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+    expect(config).toMatchObject({
+      providerApi: { enabled: true, apiKeyFile: join(appHome, "secrets", "provider-api.key") },
+      browserHost: "launcher",
+      solAvailable: true,
+      proAvailable: true,
+    });
+    expect(config.providerApi.apiKey).toBeUndefined();
+    expect(readFileSync(config.providerApi.apiKeyFile, "utf8").trim()).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    if (process.platform !== "win32") expect(statSync(config.providerApi.apiKeyFile).mode & 0o777).toBe(0o600);
   } finally {
     await new Promise<void>(resolveClose => control.close(() => resolveClose()));
     rmSync(root, { recursive: true, force: true });
@@ -531,6 +615,36 @@ test("explicit signed-in identity refresh clears only that workspace cooldown", 
       nextIndex: 1,
       cooldowns: { slot_other: expect.any(Number) },
     });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("explicit signed-out identity refresh clears only that workspace login marker", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-chatgpt-web-cli-account-signed-out-"));
+  const appHome = join(root, "app");
+  mkdirSync(appHome, { recursive: true });
+  writeFileSync(join(appHome, "config.json"), `${JSON.stringify(browserOnlyConfig(appHome, {
+    accounts: [
+      { id: "account_one", name: "One", credentialId: "primary" },
+      { id: "account_other", name: "Other", credentialId: "primary" },
+    ],
+    credentials: [],
+    slots: [
+      { id: "slot_one", accountId: "account_one", label: "One", storageStatePath: join(appHome, "browser", "slots", "slot_one", "storage-state.json"), credentialId: "primary", signedIn: true },
+      { id: "slot_other", accountId: "account_other", label: "Other", storageStatePath: join(appHome, "browser", "slots", "slot_other", "storage-state.json"), credentialId: "primary", signedIn: true },
+    ],
+  }))}\n`);
+  try {
+    const result = await runCli(["accounts", "update-identity", "slot_one", "--signed-out"], {
+      ...process.env,
+      CODEX_CHATGPT_WEB_HOME: appHome,
+    });
+    const saved = JSON.parse(readFileSync(join(appHome, "config.json"), "utf8"));
+
+    expect(result.exitCode).toBe(0);
+    expect(saved.accountRotation.slots.find((slot: { id: string }) => slot.id === "slot_one").signedIn).toBe(false);
+    expect(saved.accountRotation.slots.find((slot: { id: string }) => slot.id === "slot_other").signedIn).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

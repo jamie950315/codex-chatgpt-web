@@ -1,7 +1,23 @@
-import { expect, test } from "bun:test";
+import { afterEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultConfig } from "../src/config";
 import { CHATGPT_WEB_MODEL_ROUTES, resolveChatGptWebContextLimits } from "../src/chatgpt-web-models";
 import { modelsRequest } from "../src/server";
+
+const providerRoots: string[] = [];
+afterEach(() => {
+  for (const root of providerRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+function enableProviderApi(config: ReturnType<typeof defaultConfig>): void {
+  const root = mkdtempSync(join(tmpdir(), "codex-web-gpt-provider-models-"));
+  providerRoots.push(root);
+  const apiKeyFile = join(root, "provider-api.key");
+  writeFileSync(apiKeyFile, "provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz\n", { mode: 0o600 });
+  config.providerApi = { enabled: true, apiKeyFile };
+}
 
 test("proxies official /models auth and query, then appends the fixed ChatGPT Web models", async () => {
   const request = new Request("http://127.0.0.1:17841/v1/models?client_version=1.2.3", {
@@ -122,4 +138,53 @@ test("ChatGPT-only native catalog rows do not turn model discovery into a 502", 
     .toHaveLength(3);
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))
     .every(model => model.supported_in_api === true)).toBe(true);
+});
+
+test("provider mode publishes an authenticated OpenAI model list without native upstream access", async () => {
+  const config = defaultConfig("full");
+  config.proAvailable = true;
+  enableProviderApi(config);
+  let upstreamCalls = 0;
+
+  const response = await modelsRequest(
+    new Request("http://127.0.0.1:17841/v1/models", {
+      headers: { authorization: "Bearer provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz" },
+    }),
+    config,
+    async () => {
+      upstreamCalls += 1;
+      throw new Error("provider discovery must not reach the native Codex backend");
+    },
+  );
+
+  expect(response.status).toBe(200);
+  expect(upstreamCalls).toBe(0);
+  expect(await response.json()).toEqual({
+    object: "list",
+    data: [
+      { id: "chatgpt-web/light", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/medium", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/high", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/extra-high", object: "model", owned_by: "chatgpt-web" },
+      { id: "chatgpt-web/pro", object: "model", owned_by: "chatgpt-web" },
+    ],
+  });
+});
+
+test("provider mode rejects model discovery without its exact Bearer key", async () => {
+  const config = defaultConfig("browser-only");
+  enableProviderApi(config);
+
+  for (const authorization of [undefined, "Bearer wrong-provider-key"]) {
+    const response = await modelsRequest(
+      new Request("http://127.0.0.1:17841/v1/models", {
+        headers: authorization ? { authorization } : undefined,
+      }),
+      config,
+      async () => {
+        throw new Error("unauthorized provider discovery must not reach native Codex");
+      },
+    );
+    expect(response.status).toBe(401);
+  }
 });

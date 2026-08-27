@@ -80,6 +80,7 @@ Setup options:
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
   --replace-codex-route        Reversibly replace an existing openai_base_url
+  --provider-mode              Run as an authenticated Provider API without changing Codex routing
   --subagent-protocol MODE     compatibility-v1 (default) or native (advanced)
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
@@ -244,10 +245,14 @@ async function accountsCommand(args: string[]): Promise<void> {
     const slotId = args.shift();
     if (!slotId) throw new Error("accounts update-identity requires a slot id");
     const signedIn = takeFlag(args, "--signed-in");
+    const signedOut = takeFlag(args, "--signed-out");
+    if (signedIn && signedOut) {
+      throw new Error("accounts update-identity accepts only one of --signed-in or --signed-out");
+    }
     const identity = {
       email: takeOption(args, "--email"),
       workspaceName: takeOption(args, "--workspace-name"),
-      ...(signedIn ? { signedIn: true } : {}),
+      ...(signedIn ? { signedIn: true } : signedOut ? { signedIn: false } : {}),
     };
     assertNoArgs(args);
     mutateConfig(current => updateAccountIdentity(current, slotId, identity) as typeof current);
@@ -368,6 +373,10 @@ async function setupCommand(args: string[]): Promise<void> {
   }
   if (biggerContext || standardContext) options.experimentalBiggerContext = biggerContext;
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
+  options.providerMode = takeFlag(args, "--provider-mode");
+  if (options.providerMode && options.replaceCodexRoute) {
+    throw new Error("Choose either --provider-mode or --replace-codex-route");
+  }
   options.restartService = takeFlag(args, "--restart-service");
   assertNoArgs(args);
 
@@ -405,7 +414,12 @@ async function setupCommand(args: string[]): Promise<void> {
     stdout.write("One account-level step remains: attach the tunnel to the ChatGPT connector named in config.\n");
     stdout.write("Open: https://chatgpt.com/#settings/Plugins\n");
   }
-  stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
+  if (options.providerMode) {
+    const config = loadConfig();
+    stdout.write(`Provider API configured at http://${config.host}:${config.port}/v1\n`);
+  } else {
+    stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
+  }
 }
 
 async function doctorCommand(args: string[]): Promise<void> {

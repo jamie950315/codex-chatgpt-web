@@ -6,6 +6,7 @@ const { pathToFileURL } = require("node:url");
 const {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   Menu,
@@ -17,6 +18,7 @@ const {
 } = require("electron");
 const {
   accountIdentityUpdate,
+  accountSessionExpiredUpdate,
   BrowserHost,
   createSerialTaskQueue,
   reconcileAccountValidationReport,
@@ -32,6 +34,8 @@ const {
 const { RuntimeHost } = require("./runtime.cjs");
 const { ensurePackagedRuntime } = require("./runtime-install.cjs");
 const { RuntimeSupervisor } = require("./runtime-supervisor.cjs");
+const { createProviderController } = require("./provider-controller.cjs");
+const { runtimeStartupPolicy } = require("./startup-policy.cjs");
 const { shutdownFailureMessage } = require("./shutdown-result.cjs");
 const { DEVELOPMENT_PROFILE, resolveLauncherProfile } = require("./profile.cjs");
 const { runtimeBundlePaths } = require("./runtime-command.cjs");
@@ -373,6 +377,7 @@ function smokePassedForCurrentVersion(state) {
 
 function registerIpc({ logger, stateStore }) {
   const handle = (channel, handler) => registerLoggedIpc(ipcMain, logger, channel, handler);
+  const providerController = createProviderController({ clipboard, runtimeHost });
   handle("launcher:snapshot", async () => ({
     profile: LAUNCHER_PROFILE.kind,
     profilePaths: {
@@ -384,6 +389,7 @@ function registerIpc({ logger, stateStore }) {
     browser: browserHost?.snapshot() ?? null,
     connectorName: runtimeHost.browserConnectorName(),
     mcpCredentialsConfigured: runtimeHost?.mcpCredentialsConfigured() ?? false,
+    provider: providerController.status(),
     accounts: runtimeHost?.listAccounts?.() ?? { accounts: [], primaryTunnelId: "" },
     logs: logger.recent(),
     urls: { github: GITHUB_URL, x: X_URL, connectors: CONNECTORS_URL, tunnels: TUNNELS_URL, keys: KEYS_URL },
@@ -396,6 +402,21 @@ function registerIpc({ logger, stateStore }) {
   }));
 
   handle("launcher:set-language", (_event, language) => stateStore.update({ language: validateLanguage(language) }));
+  handle("launcher:provider-setup", async () => {
+    if (IS_DEV_PROFILE) throw new Error("Provider API is unavailable in the isolated DEV launcher profile");
+    if (!browserHost?.snapshot()?.authenticated) throw new Error("Sign in to ChatGPT before enabling Provider API");
+    const provider = await providerController.setup();
+    const state = stateStore.update({
+      bridgeEnabled: false,
+      coreSetupComplete: true,
+      codexCatalogVerified: true,
+      codexRestartRequired: false,
+    });
+    send("launcher:state-changed", state);
+    return provider;
+  });
+  handle("launcher:provider-copy-key", () => providerController.copyKey());
+  handle("launcher:provider-rotate-key", () => providerController.rotateKey());
   handle("launcher:open-social", async (_event, target) => {
     const url = target === "github" ? GITHUB_URL : target === "x" ? X_URL : null;
     if (!url) throw new Error("Unknown social target");
@@ -538,6 +559,17 @@ function registerIpc({ logger, stateStore }) {
             status: "error",
             message: error instanceof Error ? error.message : String(error),
           };
+        }
+        const signedOutUpdate = accountSessionExpiredUpdate(workspace.id, login);
+        if (signedOutUpdate) {
+          try {
+            await runtimeHost.updateAccountIdentity(signedOutUpdate);
+          } catch (error) {
+            logger.warn("accounts.expired_session_update_failed", {
+              slotId: workspace.id,
+              message: error instanceof Error ? error.message : String(error),
+            });
+          }
         }
         let connector = { status: "skipped", message: "Sign in before checking the Codex connector" };
         if (login.status === "ok") {
@@ -732,11 +764,12 @@ function registerIpc({ logger, stateStore }) {
       );
     }
     const result = IS_DEV_PROFILE ? await runtimeHost.setupDevCore() : await runtimeHost.setupCore();
+    const providerMode = !IS_DEV_PROFILE && runtimeHost.providerModeConfigured();
     stateStore.update({
-      bridgeEnabled: IS_DEV_PROFILE ? false : true,
+      bridgeEnabled: IS_DEV_PROFILE || providerMode ? false : true,
       coreSetupComplete: true,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexCatalogVerified: IS_DEV_PROFILE || providerMode ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE || providerMode ? false : true,
       ...(result.mode === "full" ? {
         mcpRuntimeInstalled: true,
         mcpSetupComplete: false,
@@ -752,8 +785,8 @@ function registerIpc({ logger, stateStore }) {
         message: error instanceof Error ? error.message : String(error),
       });
     });
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
-    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE };
+    if (!IS_DEV_PROFILE && !providerMode) startCatalogVerificationMonitor({ logger, stateStore });
+    return { ok: true, stdout: result.stdout, restartRequired: !IS_DEV_PROFILE && !providerMode };
   });
   handle("launcher:accounts-add-workspace", async (_event, input) => {
     const result = await runtimeHost.addWorkspace(input || {});
@@ -808,11 +841,12 @@ function registerIpc({ logger, stateStore }) {
       runtimeKey: typeof input?.runtimeKey === "string" ? input.runtimeKey : "",
       replace: input?.replace === true,
     });
+    const providerMode = !IS_DEV_PROFILE && runtimeHost.providerModeConfigured();
     stateStore.update({
       mcpRuntimeInstalled: true,
       mcpSetupComplete: false,
       mcpGuideStep: 2,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexRestartRequired: IS_DEV_PROFILE || providerMode ? false : true,
     });
     return { ok: true, stdout: result.stdout };
   });
@@ -832,13 +866,14 @@ function registerIpc({ logger, stateStore }) {
   });
   handle("launcher:bigger-context", async (_event, enabled) => {
     const result = await runtimeHost.setBiggerContext(enabled === true);
+    const providerMode = !IS_DEV_PROFILE && runtimeHost.providerModeConfigured();
     const state = stateStore.update({
       experimentalBiggerContext: result.enabled,
-      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
-      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+      codexCatalogVerified: IS_DEV_PROFILE || providerMode ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE || providerMode ? false : true,
     });
     send("launcher:state-changed", state);
-    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    if (!IS_DEV_PROFILE && !providerMode) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
   handle("launcher:set-preference", (_event, key, value) => {
@@ -1138,14 +1173,17 @@ async function start() {
         send("launcher:state-changed", failed);
       });
     }
-  } else void (async () => {
+  } else {
+    let startupPolicy = runtimeStartupPolicy(null);
+    void (async () => {
     const upgrade = await runtimeHost.upgradeManagedRuntime();
     if (upgrade.updated) {
+      const providerMode = upgrade.providerMode === true;
       const state = stateStore.update({
         bridgeEnabled: upgrade.bridgeEnabled,
         coreSetupComplete: true,
-        codexCatalogVerified: false,
-        codexRestartRequired: true,
+        codexCatalogVerified: providerMode,
+        codexRestartRequired: !providerMode,
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1167,6 +1205,7 @@ async function start() {
       });
     }
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
+    startupPolicy = runtimeStartupPolicy(configuredRuntime.config);
     if (configuredRuntime.configured) {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
       if (stateStore.read().experimentalBiggerContext !== enabled) {
@@ -1174,7 +1213,7 @@ async function start() {
         send("launcher:state-changed", state);
       }
     }
-    try {
+    if (startupPolicy.inspectRoute) try {
       const route = await runtimeHost.bridgeStatus();
       if (route.installed) {
         const current = stateStore.read();
@@ -1235,7 +1274,9 @@ async function start() {
       }
       return;
     }
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = startupPolicy.restoreRouteOnFailure
+      ? await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore })
+      : { restored: false };
     const state = stateStore.update({ coreSetupComplete: false, codexCatalogVerified: false });
     send("launcher:state-changed", state);
     if (runtime.status === "external" || runtime.status === "needs-setup") {
@@ -1256,7 +1297,9 @@ async function start() {
     }
   }).catch(async (error) => {
     const primary = error instanceof Error ? error.message : String(error);
-    const routeRecovery = await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore });
+    const routeRecovery = startupPolicy.restoreRouteOnFailure
+      ? await restoreCodexRouteAfterRuntimeFailure({ logger, stateStore })
+      : { restored: false };
     const message = routeRecovery.error
       ? `${primary}; restoring the previous Codex route also failed: ${routeRecovery.error}`
       : routeRecovery.restored
@@ -1267,6 +1310,7 @@ async function start() {
     send("launcher:state-changed", state);
     publishOperation({ name: "runtime-start", status: "failed", message });
   });
+  }
 
   app.on("activate", () => showMainWindow());
   app.on("before-quit", (event) => {

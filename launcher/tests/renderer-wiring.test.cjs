@@ -71,7 +71,7 @@ test("normal shutdown persists the ChatGPT session before closing browser views"
 
 test("DEV launcher exposes its profile and supervises only its Full-mode MCP runtime", () => {
   assert.match(electronMain, /profile:\s*LAUNCHER_PROFILE\.kind/);
-  assert.match(electronMain, /if \(IS_DEV_PROFILE\) \{[\s\S]*?config\?\.mode === "full"[\s\S]*?runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?\} else void \(async \(\) => \{/);
+  assert.match(electronMain, /if \(IS_DEV_PROFILE\) \{[\s\S]*?config\?\.mode === "full"[\s\S]*?runtimeSupervisor\.startIfConfigured\(\)[\s\S]*?\} else \{[\s\S]*?void \(async \(\) => \{/);
   assert.match(electronMain, /await runtimeSupervisor\?\.shutdown\(\{ cancelActiveTurns: true, force: true \}\)/);
   assert.match(electronMain, /packaged:\s*app\.isPackaged && !IS_DEV_PROFILE/);
   assert.match(electronMain, /IS_DEV_PROFILE && !stateStore\.read\(\)\.onboardingComplete/);
@@ -119,6 +119,18 @@ test("launcher shares only privacy-safe exported diagnostics", () => {
   assert.match(electronMain, /launcher:export-logs[\s\S]*?showSaveDialog[\s\S]*?exportSanitizedLogs/);
   assert.doesNotMatch(preloadSource, /launcher:open-logs/);
   assert.doesNotMatch(electronMain, /launcher:open-logs/);
+});
+
+test("Provider controls expose safe status and clipboard-only key operations", () => {
+  assert.match(preloadSource, /setupProvider:[\s\S]*?launcher:provider-setup/);
+  assert.match(preloadSource, /copyProviderKey:[\s\S]*?launcher:provider-copy-key/);
+  assert.match(preloadSource, /rotateProviderKey:[\s\S]*?launcher:provider-rotate-key/);
+  assert.match(electronMain, /provider:\s*providerController\.status\(\)/);
+  assert.match(settingsSource, /snapshot\.provider/);
+  assert.match(settingsSource, /api!\.setupProvider\(\)/);
+  assert.match(settingsSource, /api!\.copyProviderKey\(\)/);
+  assert.match(settingsSource, /api!\.rotateProviderKey\(\)/);
+  assert.doesNotMatch(preloadSource, /readProviderKey/);
 });
 
 test("MCP verification failures stay inside the structured setup report", () => {

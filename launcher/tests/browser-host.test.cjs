@@ -2,6 +2,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const vm = require("node:vm");
 const {
   browserViewVisible,
   constrainBrowserBounds,
@@ -12,10 +13,13 @@ const {
 } = require("../electron/browser-state.cjs");
 const {
   accountIdentityUpdate,
+  accountSessionExpiredUpdate,
   allowedAuthUrl,
   BrowserHost,
   createSerialTaskQueue,
+  expiredSessionElementScript,
   isChatGptCloudflareChallengeResponse,
+  isChatGptExpiredSessionText,
   isTemporaryChatUrl,
   reconcileAccountValidationReport,
 } = require("../electron/browser-host.cjs");
@@ -132,6 +136,43 @@ test("captured identity evidence always persists the workspace as signed in", ()
     signedIn: true,
   });
   assert.equal(accountIdentityUpdate("slot_empty", {}), null);
+});
+
+test("expired-session validation clears only the affected workspace login marker", () => {
+  const expired = { status: "error", code: "chatgpt_session_expired", message: "Sign in again" };
+  assert.deepEqual(accountSessionExpiredUpdate("slot_expired", expired), {
+    slotId: "slot_expired",
+    signedIn: false,
+  });
+  assert.equal(accountSessionExpiredUpdate("slot_other", {
+    status: "error",
+    message: "ChatGPT browser surface is unavailable",
+  }), null);
+});
+
+test("expired ChatGPT session text is recognized in supported interface languages", () => {
+  for (const text of [
+    "Your session has expired. Please log in again to continue using the app.",
+    "你的工作階段已過期 請重新登入以繼續使用應用程式。",
+    "您的会话已过期 请重新登录以继续使用该应用。",
+  ]) {
+    assert.equal(isChatGptExpiredSessionText(text), true, text);
+  }
+  assert.equal(isChatGptExpiredSessionText("Failed to load subscription"), false);
+});
+
+test("expired-session DOM evidence remains detectable in a one-pixel hidden workspace view", () => {
+  const element = {
+    isConnected: true,
+    textContent: "你的工作階段已過期 請重新登入以繼續使用應用程式。",
+    getBoundingClientRect: () => ({ width: 0, height: 0 }),
+  };
+  const detected = vm.runInNewContext(expiredSessionElementScript(), {
+    document: { querySelectorAll: () => [element] },
+    getComputedStyle: () => ({ display: "block", visibility: "visible", opacity: "1" }),
+  });
+
+  assert.equal(detected, true);
 });
 
 test("serial task queue orders overlapping captures and wait includes the full queue", async () => {
@@ -393,6 +434,91 @@ test("hidden turn tabs retain an operational viewport without revealing the brow
   ]);
 });
 
+test("rotation home uses a configured workspace instead of the unconfigured base session", () => {
+  const baseView = { webContents: { isDestroyed: () => false } };
+  const configuredView = { webContents: { isDestroyed: () => false } };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    loginPartition: null,
+    authView: null,
+    selectedTurnTab: () => null,
+    view: baseView,
+    keepaliveViews: new Map([
+      ["persist:codex-web-gpt-chatgpt-slot_configured", configuredView],
+    ]),
+  });
+
+  assert.equal(BrowserHost.prototype.activeView.call(fixture), configuredView);
+});
+
+test("rotation home reveals only a configured workspace view", () => {
+  const visibility = [];
+  const makeView = (name) => ({
+    setBounds: bounds => visibility.push([name, "bounds", bounds]),
+    setVisible: visible => visibility.push([name, "visible", visible]),
+    webContents: { isDestroyed: () => false },
+  });
+  const baseView = makeView("base");
+  const configuredView = makeView("configured");
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    visible: true,
+    surfaceActive: true,
+    boundsReady: true,
+    bounds: { x: 12, y: 48, width: 800, height: 600 },
+    selectedTabId: "home",
+    turnTabs: new Map(),
+    authView: null,
+    loginPartition: null,
+    keepaliveViews: new Map([
+      ["persist:codex-web-gpt-chatgpt-slot_configured", configuredView],
+    ]),
+    window: { getContentSize: () => [1120, 720] },
+    view: baseView,
+  });
+
+  BrowserHost.prototype.syncViewVisibility.call(fixture);
+
+  assert.ok(visibility.some(event => (
+    event[0] === "base" && event[1] === "visible" && event[2] === false
+  )));
+  assert.ok(visibility.some(event => (
+    event[0] === "configured" && event[1] === "visible" && event[2] === true
+  )));
+  assert.ok(visibility.some(event => (
+    event[0] === "configured" && event[1] === "bounds"
+      && JSON.stringify(event[2]) === JSON.stringify(fixture.bounds)
+  )));
+});
+
+test("opening rotation browser does not load the unconfigured base session", async () => {
+  const loaded = [];
+  const configuredView = {
+    webContents: {
+      isDestroyed: () => false,
+      getURL: () => "https://chatgpt.com/?temporary-chat=true",
+    },
+  };
+  const fixture = Object.assign(Object.create(BrowserHost.prototype), {
+    show() {},
+    selectedTurnTab: () => null,
+    view: {
+      webContents: {
+        getURL: () => "about:blank#codex-web-gpt-browser-host",
+        loadURL: async url => loaded.push(url),
+      },
+    },
+    keepaliveViews: new Map([
+      ["persist:codex-web-gpt-chatgpt-slot_configured", configuredView],
+    ]),
+    probeAuthentication: async () => assert.fail("base authentication must not be probed"),
+    snapshot: () => ({ visible: true }),
+  });
+
+  const snapshot = await BrowserHost.prototype.reveal.call(fixture);
+
+  assert.deepEqual(loaded, []);
+  assert.deepEqual(snapshot, { visible: true });
+});
+
 test("manual browser operations wait for the first measured surface", async () => {
   let readinessReads = 0;
   const fixture = {
@@ -509,6 +635,37 @@ test("launcher authentication requires the Temporary Chat composer and complete 
   const result = await BrowserHost.prototype.probeAuthentication.call(fixture);
   assert.equal(result.authenticated, true);
   assert.equal(result.status, "ready");
+});
+
+test("workspace validation rejects an expired-session modal even when composer and session API remain authenticated", async () => {
+  const fixture = {
+    partition: "persist:primary",
+    view: {
+      webContents: {
+        isDestroyed: () => false,
+        getURL: () => "https://chatgpt.com/?temporary-chat=true",
+        executeJavaScript: async () => ({
+          composer: true,
+          temporary: true,
+          sessionAuthenticated: true,
+          sessionExpired: true,
+          readyState: "complete",
+          url: "https://chatgpt.com/?temporary-chat=true",
+        }),
+      },
+    },
+  };
+
+  const result = await BrowserHost.prototype.probePartitionLogin.call(
+    fixture,
+    "persist:primary",
+  );
+
+  assert.deepEqual(result, {
+    status: "error",
+    code: "chatgpt_session_expired",
+    message: "The ChatGPT session has expired. Sign in again on this workspace.",
+  });
 });
 
 test("authentication windows stay inside the launcher-owned browser partition", () => {

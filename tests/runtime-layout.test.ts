@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
   installedBunExecutable,
   loadConfig,
   loadConfigForSetup,
+  readProviderApiKey,
   providerConfig,
   resolveBrokerEndpoint,
   resolveDevSetupConnectorName,
@@ -199,4 +200,35 @@ test("Luna-only provider configuration exposes only the Luna backend", () => {
   expect(provider.defaultModel).toBe("gpt-5.6-luna");
   expect(provider.modelReasoningEfforts).toEqual({ "gpt-5.6-luna": ["low"] });
   expect(provider.chatgptWeb).toMatchObject({ solAvailable: false, proAvailable: false });
+});
+
+test("provider API configuration persists only an enabled owner-only key", () => {
+  const root = join(tmpdir(), `codex-chatgpt-web-provider-config-${process.pid}-${Date.now()}`);
+  roots.push(root);
+  process.env.CODEX_CHATGPT_WEB_HOME = root;
+  mkdirSync(root, { recursive: true });
+  const config = defaultConfig("browser-only");
+  const apiKeyFile = join(root, "secrets", "provider-api.key");
+  mkdirSync(join(root, "secrets"), { recursive: true });
+  writeFileSync(apiKeyFile, "provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz\n", { mode: 0o600 });
+  config.providerApi = {
+    enabled: true,
+    apiKeyFile,
+  };
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(config)}\n`);
+
+  expect(loadConfig().providerApi).toEqual(config.providerApi);
+  expect(readProviderApiKey(loadConfig())).toBe("provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz");
+
+  writeFileSync(join(root, "config.json"), `${JSON.stringify({
+    ...config,
+    providerApi: { enabled: true, apiKeyFile: "relative/provider.key" },
+  })}\n`);
+  expect(() => loadConfig()).toThrow("Invalid providerApi.apiKeyFile");
+
+  writeFileSync(join(root, "config.json"), `${JSON.stringify(config)}\n`);
+  if (process.platform !== "win32") {
+    chmodSync(apiKeyFile, 0o644);
+    expect(() => readProviderApiKey(loadConfig())).toThrow("readable only by its owner");
+  }
 });

@@ -7,6 +7,7 @@ import {
   currentRuntimeCommand,
   defaultBrokerEndpoint,
   defaultConfig,
+  ensureProviderApiKeyFile,
   getConfigPath,
   loadConfigForSetup,
   resolveDevSetupConnectorName,
@@ -20,6 +21,7 @@ import {
   storedBrowserLoginCapabilities,
 } from "./browser-login";
 import {
+  inspectCodexIntegration,
   installCodexIntegration,
   preflightCodexIntegration,
   readCodexSubagentProtocol,
@@ -53,6 +55,7 @@ export interface SetupOptions {
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
   experimentalBiggerContext?: boolean;
+  providerMode?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
   acknowledgedUnofficial?: boolean;
@@ -67,7 +70,7 @@ export interface SetupResult {
   loginCreated: boolean;
   serviceLoaded: boolean;
   tunnelReady: boolean | null;
-  codexRestartRequired: true;
+  codexRestartRequired: boolean;
   connectorSetupRequired: boolean;
 }
 
@@ -126,6 +129,7 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalBiggerContext: before.experimentalBiggerContext,
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
+    providerApi: before.providerApi,
     runtimeCommand: before.runtimeCommand,
     tunnel: before.tunnel,
   }) !== JSON.stringify({
@@ -147,9 +151,21 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     experimentalBiggerContext: after.experimentalBiggerContext,
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
+    providerApi: after.providerApi,
     runtimeCommand: after.runtimeCommand,
     tunnel: after.tunnel,
   });
+}
+
+export function providerModeRouteConflict(status: {
+  installed: boolean;
+  active: boolean;
+  errors: string[];
+}): boolean {
+  if (!status.installed || !status.active) return false;
+  return !status.errors.some(error => (
+    error === "Codex openai_base_url changed after setup; refusing to overwrite the user's newer value"
+  ));
 }
 
 export function tunnelWorkerRuntimeChanged(before: AppConfig | undefined, after: AppConfig): boolean {
@@ -311,12 +327,28 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (existing?.purpose === DEV_CONFIG_PURPOSE) {
     throw new Error("A DEV harness configuration cannot be installed into Codex");
   }
+  if (options.providerMode && existing?.providerApi?.enabled !== true) {
+    const integration = inspectCodexIntegration();
+    if (providerModeRouteConflict(integration)) {
+      throw new Error(
+        "Disconnect the Codex bridge in Settings before enabling the independent Provider API",
+      );
+    }
+  }
   const config = baseConfig(existing, {
     ...options,
     subagentProtocol: options.subagentProtocol
       ?? readCodexSubagentProtocol(existing?.subagentProtocol ?? "compatibility-v1"),
   });
   delete config.purpose;
+  if (options.providerMode) {
+    config.providerApi = {
+      enabled: true,
+      apiKeyFile: ensureProviderApiKeyFile(existing?.providerApi?.apiKeyFile),
+    };
+  } else if (config.providerApi) {
+    config.providerApi.enabled = false;
+  }
   const launcherOwned = config.browserHost === "launcher";
   if (!launcherOwned && process.platform !== "darwin") {
     throw new Error(
@@ -324,9 +356,11 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
       + "Use the Codex Web GPT launcher on Windows or Linux.",
     );
   }
-  preflightCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  if (!options.providerMode) {
+    preflightCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+  }
   const refreshTunnelWorker = tunnelWorkerRuntimeChanged(existing, config);
   if (existing && options.restartService) config.controlToken = randomBytes(32).toString("base64url");
   const beforeService = getServiceStatus();
@@ -456,9 +490,11 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     launcherOwned && existing && existing.browserHost !== "launcher",
   );
   if (!migratingTerminalRuntime) removeLegacyRuntimeArtifacts(config);
-  installCodexIntegration(config, {
-    replaceExistingRoute: options.replaceCodexRoute,
-  });
+  if (!options.providerMode) {
+    installCodexIntegration(config, {
+      replaceExistingRoute: options.replaceCodexRoute,
+    });
+  }
 
   return {
     mode: config.mode,
@@ -466,7 +502,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     loginCreated,
     serviceLoaded: launcherOwned ? false : getServiceStatus().loaded,
     tunnelReady,
-    codexRestartRequired: true,
+    codexRestartRequired: !options.providerMode,
     connectorSetupRequired: config.mode === "full",
   };
 }

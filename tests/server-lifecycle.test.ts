@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chatGptWebTraceId } from "../src/adapters/chatgpt-web";
@@ -12,6 +12,58 @@ import { HttpTurnCounter, responseRequest, routeChatGptWebRequest, startServer }
 test("DEV harness configuration cannot bind a Responses listener", () => {
   const config = { ...defaultConfig("browser-only"), purpose: "dev-harness" as const, port: 0 };
   expect(() => startServer(config)).toThrow("cannot start a Responses listener");
+});
+
+test("provider runtime authenticates its complete public API surface and never exposes native search", async () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-web-gpt-provider-runtime-"));
+  const apiKey = "provider_api_test_key_0123456789abcdefghijklmnopqrstuvwxyz";
+  const apiKeyFile = join(root, "provider-api.key");
+  writeFileSync(apiKeyFile, `${apiKey}\n`, { mode: 0o600 });
+  const config = {
+    ...defaultConfig("browser-only"),
+    port: 0,
+    providerApi: { enabled: true, apiKeyFile },
+  };
+  let upstreamCalls = 0;
+  const server = startServer(config, {
+    fetchUpstream: async () => {
+      upstreamCalls += 1;
+      return Response.json({ results: ["must-not-be-visible"] });
+    },
+  });
+  const endpoint = `http://127.0.0.1:${server.port}`;
+  try {
+    const publicRequests = [
+      new Request(`${endpoint}/v1/models`),
+      new Request(`${endpoint}/v1/responses`),
+      new Request(`${endpoint}/v1/responses`, { method: "POST", body: "{}" }),
+      new Request(`${endpoint}/v1/responses/compact`, { method: "POST", body: "{}" }),
+      new Request(`${endpoint}/v1/alpha/search`, { method: "POST", body: "{}" }),
+    ];
+    for (const request of publicRequests) {
+      const response = await fetch(request);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({
+        error: { type: "authentication_error", code: "invalid_api_key" },
+      });
+    }
+
+    const models = await fetch(`${endpoint}/v1/models`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    expect(models.status).toBe(200);
+
+    const search = await fetch(`${endpoint}/v1/alpha/search`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+      body: JSON.stringify({ query: "private" }),
+    });
+    expect(search.status).toBe(404);
+    expect(upstreamCalls).toBe(0);
+  } finally {
+    await server.stop(true);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 async function waitForTurnCount(turns: HttpTurnCounter, expected: number): Promise<void> {
