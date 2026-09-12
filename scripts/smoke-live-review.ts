@@ -23,12 +23,14 @@ const kind = (process.argv[5] ?? "words") as FixtureKind;
 if (!["words", "code", "chinese"].includes(kind)) throw new Error("Invalid fixture kind");
 const stagingPolicy = process.argv[6] ?? "auto";
 if (!["auto", "medium", "max"].includes(stagingPolicy)) throw new Error("Invalid staging policy");
+const chatMode = process.env.CGW_LIVE_CHAT_MODE ?? "temporary";
+if (!["temporary", "regular"].includes(chatMode)) throw new Error("Invalid live chat mode");
 const installed = loadConfig();
 const root = resolve("runtime", `live-review-${scenario}-${Date.now()}-${randomUUID().slice(0, 8)}`);
 mkdirSync(root, { recursive: true, mode: 0o700 });
 process.env.CODEX_CHATGPT_WEB_HOME = root;
 let helper = resolve("launcher/build/runtime/app/browser-helper.cjs");
-if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1") {
+if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1" || chatMode === "regular") {
   // Experimental control, not a production change: vary only staging effort in an isolated build.
   const workerPath = resolve("src/adapters/chatgpt-web/browser-worker.ts");
   const original = readFileSync(workerPath, "utf8");
@@ -44,12 +46,34 @@ if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1") {
     variant = variant.replace(points[1]!, points[1] + `\n      stopLiveObserver = attachLiveNetworkObserver(page, ${JSON.stringify(join(root, "network.jsonl"))}, [...(multipartStages ?? []).map(stage => stage.text), multipartFinalPrompt ?? prepared.text]);`);
     variant = variant.replace(points[2]!, "      await stopLiveObserver?.();\n" + points[2]);
   }
+  if (process.env.CGW_LIVE_INSPECT_CONTROLS === "1") {
+    const controlPoint = '      await captureDiagnostic?.("effort-slider-visible");';
+    if (variant.split(controlPoint).length !== 2) throw new Error("Control inspection point changed");
+    variant = variant.replace(controlPoint, controlPoint + '\n      console.info("LIVE_CONTROL_LABELS " + JSON.stringify({items: await page.locator(CHATGPT_EFFORT_ITEM_SELECTOR).allTextContents(), sliderText: await sliderContainer.innerText(), controlText: await currentEffort.innerText(), valueText: await effortSlider.getAttribute("aria-valuetext")}));\n      throw new Error("LIVE_CONTROL_INSPECTION_ONLY");');
+  }
+  if (chatMode === "regular" && process.env.CGW_LIVE_INSPECT_CONTROLS !== "1") {
+    const modelPoint = '    await captureDiagnostic?.("effort-menu-open-requested");';
+    if (variant.split(modelPoint).length !== 2) throw new Error("Regular model selection point changed");
+    variant = variant.replace(modelPoint, modelPoint + '\n    const regularChoice = page.getByRole("menuitemradio", { name: "GPT-5.6 Sol", exact: true });\n    await regularChoice.waitFor({ state: "visible", timeout: 10000 });\n    const modal = page.locator("[role=dialog], [role=alertdialog]").filter({visible:true});\n    if(await modal.count()){ console.info("LIVE_REGULAR_MODAL " + (await modal.allTextContents()).join(" ").slice(0,800)); throw new Error("Regular-chat modal requires review"); }\n    await regularChoice.press("Enter");\n    await new Promise(resolve=>setTimeout(resolve,500));\n    const selectedText = await currentEffort.innerText();\n    console.info("LIVE_REGULAR_SELECTED_TEXT " + selectedText);\n    if(!selectedText.includes("Sol")) throw new Error("Regular Sol selection not confirmed");\n    await captureDiagnostic?.("regular-sol-selected");\n    console.info("LIVE_REGULAR_MODEL GPT-5.6 Sol");\n    return mode;');
+  }
   writeFileSync(join(root, "variant-browser-worker.ts"), variant, { mode: 0o600 });
+  const sessionPath = resolve("src/chatgpt-session.ts");
+  let sessionVariant = readFileSync(sessionPath, "utf8");
+  if (chatMode === "regular") {
+    const urlNeedle = 'export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";';
+    const guardNeedle = 'url.searchParams.get("temporary-chat") !== "true"';
+    if (sessionVariant.split(urlNeedle).length !== 2 || sessionVariant.split(guardNeedle).length !== 2) throw new Error("Regular-chat experiment source changed");
+    sessionVariant = sessionVariant.replace(urlNeedle, 'export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/";')
+      .replace(guardNeedle, 'url.searchParams.has("temporary-chat")');
+    writeFileSync(join(root, "variant-chatgpt-session.ts"), sessionVariant, { mode: 0o600 });
+  }
   const build = await Bun.build({ entrypoints: [resolve("src/adapters/chatgpt-web/browser-helper-main.ts")],
     target: "node", format: "cjs", minify: true, packages: "external", external: ["playwright-core"],
     outdir: root, naming: "browser-helper.cjs", plugins: [{ name: "isolated-staging-control", setup(builder) {
       builder.onLoad({ filter: /browser-worker\.ts$/ }, args => args.path === workerPath
         ? { contents: variant, loader: "ts" } : undefined);
+      if (chatMode === "regular") builder.onLoad({ filter: /chatgpt-session\.ts$/ }, args => args.path === sessionPath
+        ? { contents: sessionVariant, loader: "ts" } : undefined);
     } }],
   });
   if (!build.success) throw new Error(build.logs.map(log => log.message).join("\n"));
@@ -112,7 +136,7 @@ const body = { model, stream: false,
   client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) }, input };
 writeFileSync(join(root, "request.json"), JSON.stringify(body), { mode: 0o600 });
 writeFileSync(join(root, "expected.json"), JSON.stringify(fixture.expected), { mode: 0o600 });
-console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, wordsPerRecord, root, helperHash, fixtureHash, threadId, turnId, port: server.port }));
+console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, chatMode, wordsPerRecord, root, helperHash, fixtureHash, threadId, turnId, port: server.port }));
 const started = Date.now();
 try {
   const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses${scenario === "compaction" ? "/compact" : ""}`, {
@@ -130,7 +154,8 @@ try {
   const passed = response.ok && !result.error && turnCompleted && compiledEvidence.trimmed === 0
     && ackCount === Number(compiledEvidence.parts) - 1
     && (scenario === "short" ? output.includes("WEBGPTLIVEPONG") : score.complete);
-  const summary = { event: "LIVE_REVIEW_RESULT", scenario, model, kind, stagingPolicy, wordsPerRecord,
+  const summary = { event: "LIVE_REVIEW_RESULT", scenario, model, kind, stagingPolicy, chatMode,
+    regularModel: chatMode === "regular" ? "GPT-5.6 Sol" : undefined, wordsPerRecord,
     outcome: passed ? "complete" : !response.ok || result.error ? "request_error"
       : !turnCompleted || ackCount !== Number(compiledEvidence.parts) - 1 ? "transport_incomplete"
       : compiledEvidence.trimmed !== 0 ? "application_trim" : "recall_failure",

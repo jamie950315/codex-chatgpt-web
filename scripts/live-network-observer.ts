@@ -13,6 +13,7 @@ export function summarizeLiveRequest(value: unknown, expected: string[]) {
   return {
     keys: Object.keys(body), model: modelValue(body.model), action: modelValue(body.action),
     reasoningEffort: modelValue(body.reasoning_effort), thinkingEffort: modelValue(body.thinking_effort),
+    historyAndTrainingDisabled: typeof body.history_and_training_disabled === "boolean" ? body.history_and_training_disabled : undefined,
     systemHints: Array.isArray(body.system_hints) ? body.system_hints.map(modelValue).filter(Boolean) : undefined,
     conversationHash: hash(body.conversation_id), parentHash: hash(body.parent_message_id),
     messages: Array.isArray(body.messages) ? body.messages.map((message: any) => {
