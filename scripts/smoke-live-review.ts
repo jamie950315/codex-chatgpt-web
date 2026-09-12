@@ -5,7 +5,7 @@ import { loadConfig } from "../src/config";
 import { startServer } from "../src/server";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
-import { makeLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind } from "./live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind } from "./live-context-fixture";
 import { resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
@@ -47,6 +47,10 @@ if (stagingPolicy !== "auto") {
   helper = join(root, "browser-helper.cjs");
 }
 const helperHash = createHash("sha256").update(readFileSync(helper)).digest("hex");
+const fixture = process.env.CGW_LIVE_FIXTURE
+  ? validateLiveContextFixture(JSON.parse(readFileSync(process.env.CGW_LIVE_FIXTURE, "utf8")))
+  : makeLiveContextFixture(kind, scenario === "short" ? 1 : wordsPerRecord);
+const fixtureHash = createHash("sha256").update(JSON.stringify(fixture.content)).digest("hex");
 let compiledEvidence: Record<string, unknown> = {};
 const server = startServer({
   ...installed, mode: "browser-only", host: "127.0.0.1", port: 0,
@@ -84,7 +88,6 @@ const metadata = { thread_id: threadId, turn_id: turnId };
 const envelope = `<environment_context>\n<cwd>${process.cwd()}</cwd>\n<approval_policy>never</approval_policy>\n<sandbox_mode>read-only</sandbox_mode>\n</environment_context>`;
 const message = (text: string) => ({ type: "message", role: "user", content: [{ type: "input_text", text }],
   internal_chat_message_metadata_passthrough: { turn_id: turnId } });
-const fixture = makeLiveContextFixture(kind, scenario === "short" ? 1 : wordsPerRecord);
 const input = scenario === "short" ? [message(envelope), message("Return exactly WEBGPTLIVEPONG. Do not use tools.")]
   : [
     ...fixture.content.map(message),
@@ -95,7 +98,7 @@ const body = { model, stream: false,
   client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) }, input };
 writeFileSync(join(root, "request.json"), JSON.stringify(body), { mode: 0o600 });
 writeFileSync(join(root, "expected.json"), JSON.stringify(fixture.expected), { mode: 0o600 });
-console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, wordsPerRecord, root, helperHash, threadId, turnId, port: server.port }));
+console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, wordsPerRecord, root, helperHash, fixtureHash, threadId, turnId, port: server.port }));
 const started = Date.now();
 try {
   const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses${scenario === "compaction" ? "/compact" : ""}`, {
@@ -118,7 +121,7 @@ try {
       : !turnCompleted || ackCount !== Number(compiledEvidence.parts) - 1 ? "transport_incomplete"
       : compiledEvidence.trimmed !== 0 ? "application_trim" : "recall_failure",
     payloadTokens: fixture.payloadTokens, payloadChars: fixture.content.reduce((n, text) => n + text.length, 0), passed, status: response.status,
-    elapsedMs: Date.now() - started, output, score, ackCount, turnCompleted, compiled: compiledEvidence, error: result.error, root, helperHash };
+    elapsedMs: Date.now() - started, output, score, ackCount, turnCompleted, compiled: compiledEvidence, error: result.error, root, helperHash, fixtureHash };
   writeFileSync(join(root, "summary.json"), JSON.stringify(summary, null, 2), { mode: 0o600 });
   console.log(JSON.stringify({ ...summary, output: undefined }));
   if (!passed) process.exitCode = 1;

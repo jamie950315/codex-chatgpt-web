@@ -43,6 +43,24 @@ export function scoreLiveContextOutput(output: string, expected: ReturnType<type
   return { recalled: expected.length - missing.length, total: expected.length, missing, complete: missing.length === 0 };
 }
 
+export function validateLiveContextFixture(value: unknown): ReturnType<typeof makeLiveContextFixture> {
+  const candidate = value as ReturnType<typeof makeLiveContextFixture> | null;
+  if (!candidate || !Array.isArray(candidate.content) || candidate.content.length !== 8
+    || candidate.content.some(text => typeof text !== "string") || !Array.isArray(candidate.expected)
+    || candidate.expected.length !== 24 || new Set(candidate.expected.map(item => item.marker)).size !== 24) {
+    throw new Error("Invalid matched live context fixture");
+  }
+  for (const [index, item] of candidate.expected.entries()) {
+    const record = Math.floor(index / 3) + 1;
+    const position = ["HEAD", "MID", "TAIL"][index % 3];
+    const prefix = `R${String(record).padStart(2, "0")}${position}`;
+    if (item.record !== record || item.position !== position
+      || !new RegExp(`^${prefix}[A-F0-9]{12}$`).test(item.marker)
+      || !candidate.content[record - 1]!.includes(item.marker)) throw new Error("Invalid matched checkpoint");
+  }
+  return { ...candidate, payloadTokens: candidate.content.reduce((sum, text) => sum + estimateTokens(text), 0) };
+}
+
 export function extractLiveContextAnswer(result: { output?: any[] }, compaction: boolean): string {
   const items = compaction ? (result.output ?? []).slice(-1) : (result.output ?? []);
   return items.flatMap(item => {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { makeLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
 import { SUMMARY_PREFIX, encodeCompactionSummary } from "../src/responses/compaction";
 
 test("live context fixtures put unique independent checkpoints across all records", () => {
@@ -13,6 +13,14 @@ test("live context fixtures put unique independent checkpoints across all record
     expect(truncated.complete).toBe(false);
     expect(truncated.missing.map(item => item.record)).toEqual([1, 1, 1]);
   }
+});
+
+test("matched experiments reuse identical valid data and reject corrupted checkpoints", () => {
+  const fixture = makeLiveContextFixture("words", 100);
+  expect(validateLiveContextFixture(JSON.parse(JSON.stringify(fixture)))).toEqual(fixture);
+  const corrupted = structuredClone(fixture);
+  corrupted.expected[0]!.marker = "word";
+  expect(() => validateLiveContextFixture(corrupted)).toThrow("Invalid matched checkpoint");
 });
 
 test("live compaction grading never counts echoed input as newly recalled data", () => {
