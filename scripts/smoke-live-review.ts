@@ -5,7 +5,7 @@ import { loadConfig } from "../src/config";
 import { startServer } from "../src/server";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
-import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind } from "./live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, makeLiveLinkedFixture, scoreLiveChain, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind, type LiveChainNode } from "./live-context-fixture";
 import { resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
@@ -24,13 +24,14 @@ if (!["words", "code", "chinese"].includes(kind)) throw new Error("Invalid fixtu
 const stagingPolicy = process.argv[6] ?? "auto";
 if (!["auto", "medium", "max"].includes(stagingPolicy)) throw new Error("Invalid staging policy");
 const chatMode = process.env.CGW_LIVE_CHAT_MODE ?? "temporary";
-if (!["temporary", "regular"].includes(chatMode)) throw new Error("Invalid live chat mode");
+if (chatMode !== "temporary") throw new Error("Only ChatGPT Temporary Chat is in scope; regular/Work and Codex routes are excluded");
+const fileInput = process.env.CGW_LIVE_FILE_INPUT === "1";
 const installed = loadConfig();
 const root = resolve("runtime", `live-review-${scenario}-${Date.now()}-${randomUUID().slice(0, 8)}`);
 mkdirSync(root, { recursive: true, mode: 0o700 });
 process.env.CODEX_CHATGPT_WEB_HOME = root;
 let helper = resolve("launcher/build/runtime/app/browser-helper.cjs");
-if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1" || chatMode === "regular") {
+if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1" || fileInput) {
   // Experimental control, not a production change: vary only staging effort in an isolated build.
   const workerPath = resolve("src/adapters/chatgpt-web/browser-worker.ts");
   const original = readFileSync(workerPath, "utf8");
@@ -51,29 +52,24 @@ if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1" || ch
     if (variant.split(controlPoint).length !== 2) throw new Error("Control inspection point changed");
     variant = variant.replace(controlPoint, controlPoint + '\n      console.info("LIVE_CONTROL_LABELS " + JSON.stringify({items: await page.locator(CHATGPT_EFFORT_ITEM_SELECTOR).allTextContents(), sliderText: await sliderContainer.innerText(), controlText: await currentEffort.innerText(), valueText: await effortSlider.getAttribute("aria-valuetext")}));\n      throw new Error("LIVE_CONTROL_INSPECTION_ONLY");');
   }
-  if (chatMode === "regular" && process.env.CGW_LIVE_INSPECT_CONTROLS !== "1") {
-    const modelPoint = '    await captureDiagnostic?.("effort-menu-open-requested");';
-    if (variant.split(modelPoint).length !== 2) throw new Error("Regular model selection point changed");
-    variant = variant.replace(modelPoint, modelPoint + '\n    const regularChoice = page.getByRole("menuitemradio", { name: "GPT-5.6 Sol", exact: true });\n    await regularChoice.waitFor({ state: "visible", timeout: 10000 });\n    const modal = page.locator("[role=dialog], [role=alertdialog]").filter({visible:true});\n    if(await modal.count()){ console.info("LIVE_REGULAR_MODAL " + (await modal.allTextContents()).join(" ").slice(0,800)); throw new Error("Regular-chat modal requires review"); }\n    await regularChoice.press("Enter");\n    await new Promise(resolve=>setTimeout(resolve,500));\n    const selectedText = await currentEffort.innerText();\n    console.info("LIVE_REGULAR_SELECTED_TEXT " + selectedText);\n    if(!selectedText.includes("Sol")) throw new Error("Regular Sol selection not confirmed");\n    await captureDiagnostic?.("regular-sol-selected");\n    console.info("LIVE_REGULAR_MODEL GPT-5.6 Sol");\n    return mode;');
+  if (fileInput) {
+    variant = `import { chooseLiveTextFileInput } from ${JSON.stringify(resolve("scripts/live-file-input.ts"))};\n` + variant;
+    const filePoint = "    const files = chatGptPromptFilePayloads(prompt);";
+    if (variant.split(filePoint).length !== 2) throw new Error("File experiment injection point changed");
+    variant = variant.replace(filePoint, `    const files = [{ name: "live-context.txt", mimeType: "text/plain", buffer: await (await import("node:fs/promises")).readFile(${JSON.stringify(join(root, "live-context.txt"))}) }];`);
+    const pickerPoint = '    const input = page.locator(\'input[data-testid="upload-photos-input"]\');';
+    if (variant.split(pickerPoint).length !== 2) throw new Error("File picker inspection point changed");
+    variant = variant.replace(pickerPoint, '    const inputs = page.locator("input[type=file]");\n    const inputInfo = await inputs.evaluateAll(nodes => nodes.map((node,index)=>({ index, testId:node.getAttribute("data-testid"), accept:node.getAttribute("accept") ?? "" })));\n    console.info("LIVE_FILE_INPUTS " + JSON.stringify(inputInfo));\n    const picker = chooseLiveTextFileInput(inputInfo);\n    if(!picker) throw new Error("No text-capable file picker found; refusing image-only picker");\n    const input = inputs.nth(picker.index);');
+    const inputPoint = '    await input.setInputFiles(files);';
+    if (variant.split(inputPoint).length !== 2) throw new Error("File input inspection point changed");
+    variant = variant.replace(inputPoint, '    console.info("LIVE_FILE_ACCEPT " + await input.getAttribute("accept"));\n' + inputPoint);
   }
   writeFileSync(join(root, "variant-browser-worker.ts"), variant, { mode: 0o600 });
-  const sessionPath = resolve("src/chatgpt-session.ts");
-  let sessionVariant = readFileSync(sessionPath, "utf8");
-  if (chatMode === "regular") {
-    const urlNeedle = 'export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true";';
-    const guardNeedle = 'url.searchParams.get("temporary-chat") !== "true"';
-    if (sessionVariant.split(urlNeedle).length !== 2 || sessionVariant.split(guardNeedle).length !== 2) throw new Error("Regular-chat experiment source changed");
-    sessionVariant = sessionVariant.replace(urlNeedle, 'export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/";')
-      .replace(guardNeedle, 'url.searchParams.has("temporary-chat")');
-    writeFileSync(join(root, "variant-chatgpt-session.ts"), sessionVariant, { mode: 0o600 });
-  }
   const build = await Bun.build({ entrypoints: [resolve("src/adapters/chatgpt-web/browser-helper-main.ts")],
     target: "node", format: "cjs", minify: true, packages: "external", external: ["playwright-core"],
     outdir: root, naming: "browser-helper.cjs", plugins: [{ name: "isolated-staging-control", setup(builder) {
       builder.onLoad({ filter: /browser-worker\.ts$/ }, args => args.path === workerPath
         ? { contents: variant, loader: "ts" } : undefined);
-      if (chatMode === "regular") builder.onLoad({ filter: /chatgpt-session\.ts$/ }, args => args.path === sessionPath
-        ? { contents: sessionVariant, loader: "ts" } : undefined);
     } }],
   });
   if (!build.success) throw new Error(build.logs.map(log => log.message).join("\n"));
@@ -88,7 +84,16 @@ if (process.env.CGW_LIVE_RECORD_RANGE) {
   if (range.length !== 2) throw new Error("Invalid record range");
   fixture = selectLiveContextRecords(fixture, range[0]!, range[1]!);
 }
+let chain: LiveChainNode[] | undefined;
+if (process.env.CGW_LIVE_LINKED_TASK === "1") {
+  const linked = makeLiveLinkedFixture(fixture);
+  fixture = linked;
+  chain = linked.chain;
+  writeFileSync(join(root, "expected-chain.json"), JSON.stringify(chain), { mode: 0o600 });
+}
 const fixtureHash = createHash("sha256").update(JSON.stringify(fixture.content)).digest("hex");
+writeFileSync(join(root, "fixture.json"), JSON.stringify(fixture), { mode: 0o600 });
+if (fileInput) writeFileSync(join(root, "live-context.txt"), fixture.content.join("\n\n"), { mode: 0o600 });
 let compiledEvidence: Record<string, unknown> = {};
 const server = startServer({
   ...installed, mode: "browser-only", host: "127.0.0.1", port: 0,
@@ -128,15 +133,17 @@ const message = (text: string) => ({ type: "message", role: "user", content: [{ 
   internal_chat_message_metadata_passthrough: { turn_id: turnId } });
 const input = scenario === "short" ? [message(envelope), message("Return exactly WEBGPTLIVEPONG. Do not use tools.")]
   : [
-    ...fixture.content.map(message),
+    ...(fileInput ? [message("The source records are in the attached live-context.txt. Use only content directly available from that file; do not call file search, code execution, or other tools. If unavailable, report UNAVAILABLE.")] : fixture.content.map(message)),
     message(envelope),
-    message(`Copy ALL ${fixture.expected.length} distinct checkpoint tokens from the supplied records verbatim, including HEAD, MID and TAIL from every record. These tokens are the only important facts. Preserve them in the summary if summarizing. Do not use tools. If a token is not visible, say MISSING instead of guessing. Do not omit early records.`),
+    message(chain
+      ? `Starting at node ${chain[0]!.id}, follow each node's next pointer until END. Return ONLY a JSON array in traversal order, with exactly the id and seal of every visited node. Do not sort by record number. The node definitions are distributed throughout the attached original source. Do not use search, code execution or any other tools. If a definition is not directly available, report UNAVAILABLE; do not guess.`
+      : `Copy ALL ${fixture.expected.length} distinct checkpoint tokens from the supplied records verbatim, including HEAD, MID and TAIL from every record. These tokens are the only important facts. Preserve them in the summary if summarizing. Do not use tools. If a token is not visible, say MISSING instead of guessing. Do not omit early records.`),
   ];
 const body = { model, stream: false,
   client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) }, input };
 writeFileSync(join(root, "request.json"), JSON.stringify(body), { mode: 0o600 });
 writeFileSync(join(root, "expected.json"), JSON.stringify(fixture.expected), { mode: 0o600 });
-console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, chatMode, wordsPerRecord, root, helperHash, fixtureHash, threadId, turnId, port: server.port }));
+console.log(JSON.stringify({ event: "LIVE_REVIEW_START", scenario, kind, model, stagingPolicy, chatMode, fileInput, wordsPerRecord, root, helperHash, fixtureHash, threadId, turnId, port: server.port }));
 const started = Date.now();
 try {
   const response = await fetch(`http://127.0.0.1:${server.port}/v1/responses${scenario === "compaction" ? "/compact" : ""}`, {
@@ -148,14 +155,23 @@ try {
   // v1 compact responses also echo original user messages; only the new summary proves recall.
   const output = extractLiveContextAnswer(result, scenario === "compaction");
   const score = scoreLiveContextOutput(output, fixture.expected);
+  const chainScore = chain ? scoreLiveChain(output, chain) : undefined;
   const diagnosticRoot = join(root, "browser-turns");
   const checkpoints = existsSync(diagnosticRoot) ? readdirSync(diagnosticRoot).flatMap(dir => readdirSync(join(diagnosticRoot, dir))) : [];
   const { ackCount, turnCompleted } = liveDiagnosticEvidence(checkpoints);
+  const networkPath = join(root, "network.jsonl");
+  const network = existsSync(networkPath) ? readFileSync(networkPath, "utf8").trim().split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
+  const observedToolRecipients = [...new Set(network.flatMap(event => [event.recipient,
+    event.role === "tool" ? event.authorName : undefined,
+    event.deltaPath?.endsWith("/recipient") ? event.deltaValue : undefined,
+  ]).filter(value => typeof value === "string" && value !== "all"))];
   const passed = response.ok && !result.error && turnCompleted && compiledEvidence.trimmed === 0
     && ackCount === Number(compiledEvidence.parts) - 1
-    && (scenario === "short" ? output.includes("WEBGPTLIVEPONG") : score.complete);
-  const summary = { event: "LIVE_REVIEW_RESULT", scenario, model, kind, stagingPolicy, chatMode,
-    regularModel: chatMode === "regular" ? "GPT-5.6 Sol" : undefined, wordsPerRecord,
+    && (scenario === "short" ? output.includes("WEBGPTLIVEPONG") : chainScore ? chainScore.complete : score.complete);
+  const summary = { event: "LIVE_REVIEW_RESULT", scenario, model, kind, stagingPolicy, chatMode, fileInput,
+    verificationScope: chain ? "cross-document-pointer-traversal" : "distributed_checkpoint_recall", observedToolRecipients, chainScore,
+    attachmentContextSizeVerified: fileInput ? false : undefined,
+    wordsPerRecord,
     outcome: passed ? "complete" : !response.ok || result.error ? "request_error"
       : !turnCompleted || ackCount !== Number(compiledEvidence.parts) - 1 ? "transport_incomplete"
       : compiledEvidence.trimmed !== 0 ? "application_trim" : "recall_failure",

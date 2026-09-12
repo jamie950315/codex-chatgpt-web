@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomInt } from "node:crypto";
 import { estimateTokens } from "../src/lib/token-estimate";
 import { decodeCompactionSummary, SUMMARY_PREFIX } from "../src/responses/compaction";
 
@@ -66,6 +66,32 @@ export function selectLiveContextRecords(fixture: ReturnType<typeof makeLiveCont
   const content = fixture.content.slice(start - 1, end);
   return { content, expected: fixture.expected.filter(item => item.record >= start && item.record <= end),
     payloadTokens: content.reduce((sum, text) => sum + estimateTokens(text), 0) };
+}
+
+export interface LiveChainNode { id: string; next: string; seal: string }
+
+export function makeLiveLinkedFixture(fixture: ReturnType<typeof makeLiveContextFixture>) {
+  const order = fixture.expected.map(item => item.marker);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [order[i], order[j]] = [order[j]!, order[i]!];
+  }
+  const chain: LiveChainNode[] = order.map((id, i) => ({ id, next: order[i + 1] ?? "END", seal: randomBytes(8).toString("hex").toUpperCase() }));
+  const byId = new Map(chain.map(node => [node.id, node]));
+  const content = fixture.content.map(text => text.replace(/Important checkpoint token: (R\d{2}(?:HEAD|MID|TAIL)[A-F0-9]{12})/g,
+    (_match, id: string) => `const ${id} = ${JSON.stringify(byId.get(id))};`));
+  return { ...fixture, content, chain, payloadTokens: content.reduce((sum, text) => sum + estimateTokens(text), 0) };
+}
+
+export function scoreLiveChain(output: string, expected: LiveChainNode[]) {
+  // ChatGPT's DOM-to-Markdown serializer escapes outer JSON brackets outside code fences.
+  // The fixture's ids/seals are alphanumeric, so this cannot change an expected field value.
+  const rendered = output.replace(/\\([\[\]])/g, "$1");
+  const array = rendered.match(/\[\s*\{[\s\S]*\}\s*\]/)?.[0];
+  let actual: any[] = [];
+  try { const parsed = JSON.parse(array ?? "null"); if (Array.isArray(parsed)) actual = parsed; } catch { /* invalid answer */ }
+  const matched = expected.filter((node, i) => actual[i]?.id === node.id && actual[i]?.seal === node.seal).length;
+  return { complete: actual.length === expected.length && matched === expected.length, matched, total: expected.length, actualCount: actual.length };
 }
 
 export function extractLiveContextAnswer(result: { output?: any[] }, compaction: boolean): string {

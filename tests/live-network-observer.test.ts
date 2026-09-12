@@ -19,3 +19,9 @@ test("response evidence discards thought and answer text", () => {
   expect(JSON.stringify(summary)).not.toContain("PRIVATE THOUGHT");
   expect(JSON.stringify(summary)).not.toContain("raw-conversation");
 });
+
+test("network observation recognizes tool recipients in direct and delta messages", () => {
+  expect(summarizeLiveResponse({ v: { id: "fixture-id", author: { role: "assistant" }, recipient: "file_search.msearch" } }).recipient)
+    .toBe("file_search.msearch");
+  expect(summarizeLiveResponse({ p: "/message/recipient", v: "python" }).deltaValue).toBe("python");
+});

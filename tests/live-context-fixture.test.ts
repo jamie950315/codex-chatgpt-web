@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, makeLiveLinkedFixture, scoreLiveChain, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
 import { SUMMARY_PREFIX, encodeCompactionSummary } from "../src/responses/compaction";
 
 test("live context fixtures put unique independent checkpoints across all records", () => {
@@ -46,4 +46,16 @@ test("diagnostic grading ignores screenshot duplicates", () => {
     "12-multipart-stage-1-acknowledged.json", "12-multipart-stage-1-acknowledged.png",
     "13-multipart-stage-1-acknowledged.json", "15-multipart-stage-2-acknowledged.json", "29-turn-completed.json",
   ])).toEqual({ ackCount: 2, turnCompleted: true });
+});
+
+test("linked-file grading requires every independent value in traversal order", () => {
+  const fixture = makeLiveLinkedFixture(makeLiveContextFixture("code", 100));
+  expect(fixture.chain).toHaveLength(24);
+  expect(new Set(fixture.chain.map(node => node.id)).size).toBe(24);
+  for (const node of fixture.chain) expect(fixture.content.join("\n")).toContain(JSON.stringify(node));
+  expect(fixture.chain.at(-1)!.next).toBe("END");
+  expect(scoreLiveChain(JSON.stringify(fixture.chain), fixture.chain).complete).toBe(true);
+  expect(scoreLiveChain(JSON.stringify(fixture.chain).replace(/^\[/, "\\[").replace(/\]$/, "\\]"), fixture.chain).complete).toBe(true);
+  expect(scoreLiveChain(JSON.stringify([...fixture.chain].reverse()), fixture.chain).complete).toBe(false);
+  expect(scoreLiveChain(fixture.chain.map(node => node.id).join("\n"), fixture.chain).complete).toBe(false);
 });

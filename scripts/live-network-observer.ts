@@ -21,6 +21,7 @@ export function summarizeLiveRequest(value: unknown, expected: string[]) {
       const text = Array.isArray(parts) ? parts.filter((part: unknown) => typeof part === "string").join("\n") : "";
       return { idHash: hash(message.id), role: modelValue(message.author?.role), chars: text.length, textHash: hash(text),
         expectedPart: expected.findIndex(part => part === text) + 1,
+        attachmentCount: Array.isArray(message.metadata?.attachments) ? message.metadata.attachments.length : 0,
         checkpointTokens: [...text.matchAll(/\bR\d{2}(?:HEAD|MID|TAIL)[A-F0-9]{12}\b/g)].map(match => match[0]),
       };
     }) : [],
@@ -29,14 +30,19 @@ export function summarizeLiveRequest(value: unknown, expected: string[]) {
 
 export function summarizeLiveResponse(value: unknown) {
   const body = object(value) ?? {};
-  const message = object(body.message) ?? object(object(body.v)?.message);
+  const delta = object(body.v);
+  const message = object(body.message) ?? object(delta?.message)
+    ?? (delta?.author && delta.id ? delta : undefined)
+    ?? (body.author && body.id ? body : undefined);
   const metadata = object(message?.metadata) ?? {};
-  const deltaPath = typeof body.p === "string" && /\/(?:model_slug|default_model_slug|reasoning_effort)$/.test(body.p) ? body.p : undefined;
+  const deltaPath = typeof body.p === "string" && /\/(?:model_slug|default_model_slug|reasoning_effort|recipient|content_type)$/.test(body.p) ? body.p : undefined;
   return { conversationHash: hash(body.conversation_id), messageHash: hash(message?.id), parentHash: hash(body.parent_message_id),
-    role: modelValue(message?.author?.role), channel: modelValue(message?.channel),
+    role: modelValue(message?.author?.role), authorName: modelValue(message?.author?.name),
+    channel: modelValue(message?.channel), recipient: modelValue(message?.recipient),
     model: modelValue(metadata.model_slug), defaultModel: modelValue(metadata.default_model_slug),
     reasoningEffort: modelValue(metadata.reasoning_effort), thinkingEffort: modelValue(metadata.thinking_effort),
     metadataParentHash: hash(metadata.parent_id), status: modelValue(message?.status),
+    asyncSourceKind: modelValue(object(metadata.async_source)?.type) ?? modelValue(object(metadata.async_source)?.kind),
     metadataKeys: Object.keys(metadata), deltaPath, deltaValue: deltaPath ? modelValue(body.v) : undefined,
   };
 }
