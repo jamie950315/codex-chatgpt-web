@@ -6,7 +6,7 @@ import { startServer } from "../src/server";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
 import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, makeLiveLinkedFixture, scoreLiveChain, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind, type LiveChainNode } from "./live-context-fixture";
-import { resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
+import { resolveChatGptWebCompileOptions } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
 import { estimateTokens } from "../src/lib/token-estimate";
@@ -109,13 +109,16 @@ const server = startServer({
       ...adapter,
       async runTurn(parsed, incoming, emit) {
         const caps = { localToolsEnabled: false, solAvailable: installed.solAvailable, proAvailable: installed.proAvailable };
-        const parts = resolveBiggerContextMultipartParts(parsed, caps);
-        const compiled = compileChatGptWebPrompt(parsed, caps, undefined, { experimentalMultipartParts: parts });
+        const options = resolveChatGptWebCompileOptions(parsed, caps, provider.chatgptWeb?.experimentalBiggerContext, provider.chatgptWeb?.biggerContextPlan);
+        const parts = options.experimentalMultipartParts;
+        const compiled = compileChatGptWebPrompt(parsed, caps, undefined, options);
         const messages = compiledChatGptWebMessages(compiled);
         const stageMessages = messages.slice(0, -1);
         const stageMode = parts ? resolveChatGptWebMultipartStagingMode(parsed.modelId, caps,
           Math.max(...stageMessages.map(text => estimateTokens(text))), Math.max(...stageMessages.map(text => text.length))) : undefined;
         compiledEvidence = { evidenceKind: "preflight_recompute", parts: parts ?? 1, inputTokens: estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId),
+          contextFile: compiled.contextFile ? { name: compiled.contextFile.name, sha256: compiled.contextFile.sha256,
+            tokens: estimateTokens(compiled.contextFile.content), bytes: Buffer.byteLength(compiled.contextFile.content) } : undefined,
           messageTokens: messages.map(text => estimateTokens(text)), messageChars: messages.map(text => text.length),
           stagingEffort: stagingPolicy === "auto" ? stageMode?.effort : stagingPolicy, trimmed: compiled.trimmedCompactionMessages ?? 0,
           checkpointParts: fixture.expected.map(item => ({ ...item, part: messages.findIndex(text => text.includes(item.marker)) + 1 })) };
