@@ -72,3 +72,19 @@ test("does not rewrite a catalog owned by another provider", () => {
   expect(syncCockpitModelCatalog(defaultConfig("full"))).toEqual({ changed: false });
   expect(readFileSync(catalogPath, "utf8")).toBe(before);
 });
+
+test("catalog respects account availability and preserves native rows", () => {
+  const { catalogPath } = fixture();
+  const config = defaultConfig("full");
+  syncCockpitModelCatalog(config);
+  const models = () => (JSON.parse(readFileSync(catalogPath, "utf8")) as {
+    models: Array<{ slug: string; multi_agent_version?: string }>;
+  }).models;
+  expect(models().some(model => model.slug === "chatgpt-web/pro")).toBe(false);
+  expect(models()[0]!.multi_agent_version).toBe("v2");
+  config.solAvailable = false;
+  syncCockpitModelCatalog(config);
+  expect(models().filter(model => model.slug.startsWith("chatgpt-web/")).map(model => model.slug))
+    .toEqual(["chatgpt-web/luna", "chatgpt-web/think"]);
+  expect(syncCockpitModelCatalog(config).changed).toBe(false);
+});

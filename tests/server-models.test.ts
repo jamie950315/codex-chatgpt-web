@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { defaultConfig } from "../src/config";
@@ -9,6 +9,35 @@ import {
   resolveChatGptWebContextLimits,
 } from "../src/chatgpt-web-models";
 import { modelsRequest } from "../src/server";
+
+test("unreadable Cockpit catalog falls back to the native sidecar", async () => {
+  const originalHome = process.env.CODEX_HOME;
+  const root = mkdtempSync(join(tmpdir(), "cockpit-models-invalid-"));
+  process.env.CODEX_HOME = root;
+  try {
+    writeFileSync(join(root, "config.toml"), 'model_catalog_json = "cockpit-model-catalog.json"\n');
+    writeFileSync(join(root, "cockpit-model-catalog.json"), '{"models":');
+    const config = defaultConfig("full");
+    config.nativePassthrough = { baseUrl: "http://127.0.0.1:57204/v1" };
+    let upstreamUrl = "";
+    const response = await modelsRequest(new Request("http://127.0.0.1/v1/models", {
+      headers: { authorization: "Bearer fixture" },
+    }), config, async request => {
+      upstreamUrl = request.url;
+      return Response.json({ models: [{
+        slug: "gpt-native", visibility: "list", supported_reasoning_levels: [], tool_mode: "code_mode_only",
+      }] });
+    });
+    expect(response.status).toBe(200);
+    expect(upstreamUrl).toBe("http://127.0.0.1:57204/v1/models");
+    expect((await response.json()).models.some((model: { slug: string }) => model.slug === "gpt-native"))
+      .toBe(true);
+  } finally {
+    if (originalHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalHome;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("proxies official /models auth and query, then appends the fixed ChatGPT Web models", async () => {
   const request = new Request("http://127.0.0.1:17841/v1/models?client_version=1.2.3", {

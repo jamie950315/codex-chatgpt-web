@@ -21,7 +21,7 @@ const COCKPIT_MODEL_CATALOG_FILENAMES = new Set([
 ]);
 
 function catalogConfig(config: AppConfig): AppConfig {
-  return { ...config, solAvailable: true, proAvailable: true, subagentProtocol: "native" };
+  return { ...config, subagentProtocol: "native" };
 }
 
 function cockpitOwnedCatalogPath(catalogValue: string): string | undefined {

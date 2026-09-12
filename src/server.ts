@@ -404,22 +404,19 @@ export async function modelsRequest(
   contextOverride?: () => CodexModelContextOverride | undefined,
 ): Promise<Response> {
   if (config.nativePassthrough) {
-    const synced = syncCockpitModelCatalog(config);
-    if (synced.catalogPath && existsSync(synced.catalogPath)) {
-      try {
+    try {
+      const synced = syncCockpitModelCatalog(config);
+      if (synced.catalogPath && existsSync(synced.catalogPath)) {
         const catalog = augmentNativeModelCatalog(
           JSON.parse(readFileSync(synced.catalogPath, "utf8")) as unknown,
           config,
           contextOverride?.(),
         );
         return Response.json(catalog);
-      } catch (error) {
-        return formatErrorResponse(
-          502,
-          "invalid_response_error",
-          error instanceof Error ? error.message : String(error),
-        );
       }
+    } catch {
+      // Cockpit may be replacing its catalog. Keep discovery available through the sidecar.
+      console.warn("[codex-chatgpt-web] Cockpit catalog unavailable; requesting native models");
     }
   }
   let upstream: Response;
@@ -447,10 +444,11 @@ export async function modelsRequest(
 export async function nativeSearchRequest(
   req: Request,
   fetchUpstream?: NativeFetch,
-  target?: NativePassthroughTarget,
+  target?: NativePassthroughTarget | (() => NativePassthroughTarget | undefined),
 ): Promise<Response> {
   try {
-    return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream, undefined, target);
+    return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream, undefined,
+      typeof target === "function" ? target() : target);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -460,14 +458,15 @@ async function nativeImagesRequest(
   req: Request,
   endpoint: NativeImageEndpoint,
   fetchUpstream?: NativeFetch,
-  target?: NativePassthroughTarget,
+  target?: NativePassthroughTarget | (() => NativePassthroughTarget | undefined),
 ): Promise<Response> {
   const authorization = req.headers.get("authorization") ?? "";
   if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
     return formatErrorResponse(401, "authentication_error", "Native image requests require incoming Codex Bearer authorization");
   }
   try {
-    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream, undefined, target);
+    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream, undefined,
+      typeof target === "function" ? target() : target);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -831,7 +830,7 @@ export function startServer(
   }
   let draining = false;
   let shutdownPromise: Promise<void> | undefined;
-  const nativeTarget = nativePassthroughTargetFromConfig(config);
+  const nativeTarget = () => nativePassthroughTargetFromConfig(config);
   const stopCatalogSync = config.nativePassthrough
     ? startCockpitModelCatalogSync(config, {
       onError(error) {
@@ -1093,6 +1092,11 @@ export function startServer(
       return new Response("Not found", { status: 404 });
     },
   });
+  const stopServer = server.stop.bind(server);
+  server.stop = closeActiveConnections => {
+    stopCatalogSync?.();
+    return stopServer(closeActiveConnections);
+  };
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
