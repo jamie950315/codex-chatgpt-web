@@ -25,6 +25,8 @@ This project runs Codex requests through an authenticated ChatGPT browser sessio
 - Cockpit catalogs respect actual account capabilities and fall back to sidecar discovery when local catalog reading fails. Search and image requests resolve credentials per request. Stopping the server stops catalog reconciliation.
 - Package smoke uses asynchronous child lifecycle handling and exact installed executable paths for Windows cleanup; never terminate all processes by image name.
 - These review changes are local source changes until explicitly published/installed. Isolated tests do not prove real ChatGPT browser turns or Windows-native process cleanup; retain that distinction when reporting verification.
+- Live browser verification on 2026-09-12: isolated latest source/backend/helper passed a short Instant response and a 210,633-estimated-token / 3-part compaction recall fixture. A 331,230-estimated-token / 4-part fixture lost the earliest marker on Medium, High, and Pro despite zero application-side trimming and all stage acknowledgements. Do not claim 400k reliable recall; the exact effective history limit is not established. No running app configuration was changed.
+- `bun run scripts/smoke-live-review.ts short` or `compaction <words-per-record> <chatgpt-web/model>` performs opt-in real authenticated browser requests using a separately built helper at `launcher/build/runtime/app/browser-helper.cjs`. Synthetic requests, responses, summaries and diagnostics stay under ignored `runtime/live-review-*`; compact assertions inspect only the new summary, never echoed original inputs.
 
 ## Communication
 
