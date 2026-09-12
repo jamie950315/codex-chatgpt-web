@@ -89,11 +89,32 @@ describe("native /models augmentation", () => {
     const config = defaultConfig("full");
     config.proAvailable = true;
     config.experimentalBiggerContext = true;
+    config.biggerContextPlan = "pro";
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
     expect(pro.context_window).toBe(400_000);
     expect(pro.auto_compact_token_limit).toBe(360_000);
     expect(pro.multi_agent_version).toBe("disabled");
+  });
+
+  test("Plus Bigger Context keeps the original 3× catalog windows", () => {
+    const config = defaultConfig("full");
+    config.experimentalBiggerContext = true;
+    config.biggerContextPlan = "plus";
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    const high = models.find(model => model.slug === "chatgpt-web/high")!;
+    expect(high.context_window).toBe(270_000);
+    expect(high.auto_compact_token_limit).toBe(240_000);
+  });
+
+  test("ChatGPT Web can advertise spawn_agent when Web sub-agents are allowed", () => {
+    const config = defaultConfig("full");
+    config.allowWebSubagents = true;
+    config.subagentProtocol = "compatibility-v1";
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    const web = models.filter(model => String(model.slug).startsWith("chatgpt-web/"));
+    expect(web.length).toBeGreaterThan(0);
+    expect(web.every(model => model.multi_agent_version === "v1")).toBe(true);
   });
 
   test("keeps native Sol selectable in the bounded Compatibility V1 registry", () => {

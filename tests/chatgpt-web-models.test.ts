@@ -195,15 +195,26 @@ describe("fixed ChatGPT Web model routes", () => {
     });
   });
 
-  test("Bigger Context advertises Instant 128k and other efforts 400k, compacting at 90%", () => {
-    const bigger = { ...pro, experimentalBiggerContext: true };
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", bigger)).toEqual({
+  test("Bigger Context keeps original 3× windows for Plus and Instant 128k / 400k for Pro", () => {
+    const plusBigger = { ...plus, experimentalBiggerContext: true, biggerContextPlan: "plus" as const };
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", plusBigger)).toEqual({
+      contextWindow: 123_000,
+      effectiveContextWindowPercent: 78,
+      autoCompactTokenLimit: 96_000,
+    });
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "high", plusBigger)).toEqual({
+      contextWindow: 270_000,
+      effectiveContextWindowPercent: 89,
+      autoCompactTokenLimit: 240_000,
+    });
+    const proBigger = { ...pro, experimentalBiggerContext: true, biggerContextPlan: "pro" as const };
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", proBigger)).toEqual({
       contextWindow: 128_000,
       effectiveContextWindowPercent: 90,
       autoCompactTokenLimit: 115_200,
     });
     for (const effort of ["medium", "high", "xhigh", "max"] as const) {
-      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, bigger)).toEqual({
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, proBigger)).toEqual({
         contextWindow: 400_000,
         effectiveContextWindowPercent: 90,
         autoCompactTokenLimit: 360_000,

@@ -776,6 +776,29 @@ function registerIpc({ logger, stateStore }) {
     if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
     return state;
   });
+  handle("launcher:bigger-context-plan", async (_event, plan) => {
+    if (plan !== "plus" && plan !== "pro") throw new Error("ChatGPT plan must be plus or pro");
+    const result = await runtimeHost.setBiggerContextPlan(plan);
+    const state = stateStore.update({
+      biggerContextPlan: result.plan,
+      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+    });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
+  handle("launcher:allow-web-subagents", async (_event, enabled) => {
+    const result = await runtimeHost.setAllowWebSubagents(enabled === true);
+    const state = stateStore.update({
+      allowWebSubagents: result.enabled,
+      codexCatalogVerified: IS_DEV_PROFILE ? true : false,
+      codexRestartRequired: IS_DEV_PROFILE ? false : true,
+    });
+    send("launcher:state-changed", state);
+    if (!IS_DEV_PROFILE) startCatalogVerificationMonitor({ logger, stateStore });
+    return state;
+  });
   handle("launcher:zero-risk-pro", async (_event, enabled) => {
     const browserOperation = browserHost.currentOperation();
     if (browserHost.activeTraceId || browserOperation) {
@@ -1113,6 +1136,8 @@ async function start() {
       codexRestartRequired: false,
       autoStart: false,
       experimentalBiggerContext: config?.experimentalBiggerContext === true,
+      biggerContextPlan: config?.biggerContextPlan === "pro" ? "pro" : "plus",
+      allowWebSubagents: config?.allowWebSubagents === true,
       zeroRiskProEnabled: config?.zeroRiskProEnabled === true,
     });
     send("launcher:state-changed", state);
@@ -1139,6 +1164,8 @@ async function start() {
         codexCatalogVerified: false,
         codexRestartRequired: true,
         experimentalBiggerContext: runtimeHost.runtimeConfigSnapshot().config?.experimentalBiggerContext === true,
+        biggerContextPlan: runtimeHost.runtimeConfigSnapshot().config?.biggerContextPlan === "pro" ? "pro" : "plus",
+        allowWebSubagents: runtimeHost.runtimeConfigSnapshot().config?.allowWebSubagents === true,
         zeroRiskProEnabled: runtimeHost.runtimeConfigSnapshot().config?.zeroRiskProEnabled === true,
         ...(upgrade.mode === "full" ? {
           mcpRuntimeInstalled: true,
@@ -1161,11 +1188,20 @@ async function start() {
     const configuredRuntime = runtimeHost.runtimeConfigSnapshot();
     if (configuredRuntime.configured) {
       const enabled = configuredRuntime.config?.experimentalBiggerContext === true;
+      const biggerContextPlan = configuredRuntime.config?.biggerContextPlan === "pro" ? "pro" : "plus";
+      const allowWebSubagents = configuredRuntime.config?.allowWebSubagents === true;
       const zeroRiskProEnabled = configuredRuntime.config?.zeroRiskProEnabled === true;
       const saved = stateStore.read();
       if (saved.experimentalBiggerContext !== enabled
+        || saved.biggerContextPlan !== biggerContextPlan
+        || saved.allowWebSubagents !== allowWebSubagents
         || saved.zeroRiskProEnabled !== zeroRiskProEnabled) {
-        const state = stateStore.update({ experimentalBiggerContext: enabled, zeroRiskProEnabled });
+        const state = stateStore.update({
+          experimentalBiggerContext: enabled,
+          biggerContextPlan,
+          allowWebSubagents,
+          zeroRiskProEnabled,
+        });
         send("launcher:state-changed", state);
       }
     }
@@ -1181,6 +1217,8 @@ async function start() {
         coreSetupComplete: true,
         mcpRuntimeInstalled: config.mode === "full",
         experimentalBiggerContext: config.experimentalBiggerContext === true,
+        biggerContextPlan: config.biggerContextPlan === "pro" ? "pro" : "plus",
+        allowWebSubagents: config.allowWebSubagents === true,
         zeroRiskProEnabled: config.zeroRiskProEnabled === true,
         ...(runtime.bridgeRouteChanged ? {
           codexCatalogVerified: false,

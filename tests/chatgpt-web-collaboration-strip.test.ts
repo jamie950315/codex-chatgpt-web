@@ -44,6 +44,17 @@ const collaborationTools = [
   },
 ];
 
+test("ChatGPT Web requests keep collaboration tools when Web sub-agents are allowed", () => {
+  const parsed = parseRequest({
+    model: "chatgpt-web/pro",
+    tools: collaborationTools,
+  }, { allowWebSubagents: true });
+  const names = (parsed.context.tools ?? []).map(tool => tool.name);
+  expect(names).toContain("exec_command");
+  expect(names).toContain("spawn_agent");
+  expect(names).toContain("send_message");
+});
+
 test("ChatGPT Web requests drop collaboration tools so spawn_agent is not advertised", () => {
   const parsed = parseRequest({
     model: "chatgpt-web/pro",

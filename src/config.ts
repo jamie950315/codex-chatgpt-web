@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import {
   CHATGPT_WEB_ZERO_RISK_BACKEND_MODEL,
   CHATGPT_WEB_ZERO_RISK_PRO_BACKEND_MODEL,
+  isBiggerContextPlan,
+  type BiggerContextPlan,
 } from "./chatgpt-web-models";
 import type { CodexProviderConfig } from "./types";
 import { VERSION } from "./version";
@@ -84,6 +86,10 @@ export interface AppConfig {
   solAvailable: boolean;
   proAvailable: boolean;
   experimentalBiggerContext: boolean;
+  /** Plus keeps original 3× Bigger Context windows; Pro uses Instant 128k / 400k. */
+  biggerContextPlan: BiggerContextPlan;
+  /** When false, ChatGPT Web models cannot spawn Codex sub-agents. Default false. */
+  allowWebSubagents: boolean;
   /** Explicitly install the additional Pro-sized model row while Zero Risk is active. */
   zeroRiskProEnabled: boolean;
   /** Optional adapter-silence budget for the Responses watchdog. */
@@ -227,6 +233,8 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     solAvailable: true,
     proAvailable: false,
     experimentalBiggerContext: false,
+    biggerContextPlan: "plus",
+    allowWebSubagents: false,
     zeroRiskProEnabled: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -551,6 +559,12 @@ function parseConfig(value: unknown, path: string): AppConfig {
     && typeof parsed.experimentalBiggerContext !== "boolean") {
     throw new Error(`Invalid experimentalBiggerContext in ${path}`);
   }
+  if (parsed.biggerContextPlan !== undefined && !isBiggerContextPlan(parsed.biggerContextPlan)) {
+    throw new Error(`Invalid biggerContextPlan in ${path}`);
+  }
+  if (parsed.allowWebSubagents !== undefined && typeof parsed.allowWebSubagents !== "boolean") {
+    throw new Error(`Invalid allowWebSubagents in ${path}`);
+  }
   if (parsed.zeroRiskProEnabled !== undefined && typeof parsed.zeroRiskProEnabled !== "boolean") {
     throw new Error(`Invalid zeroRiskProEnabled in ${path}`);
   }
@@ -564,6 +578,10 @@ function parseConfig(value: unknown, path: string): AppConfig {
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;
   const experimentalBiggerContext = parsed.experimentalBiggerContext === true;
+  const biggerContextPlan: BiggerContextPlan = isBiggerContextPlan(parsed.biggerContextPlan)
+    ? parsed.biggerContextPlan
+    : "plus";
+  const allowWebSubagents = parsed.allowWebSubagents === true;
   const zeroRiskProEnabled = parsed.zeroRiskProEnabled === true;
   if (browserInteractionMode === "manual" && experimentalBiggerContext) {
     throw new Error(`Zero Risk does not support Bigger Context in ${path}`);
@@ -581,6 +599,8 @@ function parseConfig(value: unknown, path: string): AppConfig {
     solAvailable,
     proAvailable,
     experimentalBiggerContext,
+    biggerContextPlan,
+    allowWebSubagents,
     zeroRiskProEnabled,
   } as AppConfig;
 }
@@ -635,6 +655,8 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       solAvailable: manual ? false : config.solAvailable,
       proAvailable: manual ? false : config.proAvailable,
       experimentalBiggerContext: manual ? false : config.experimentalBiggerContext,
+      biggerContextPlan: config.biggerContextPlan,
+      allowWebSubagents: config.allowWebSubagents === true,
       ...(config.stallTimeoutSec !== undefined ? { stallTimeoutSec: config.stallTimeoutSec } : {}),
       autoApproveToolCalls: manual ? false : config.autoApproveToolCalls,
     },
