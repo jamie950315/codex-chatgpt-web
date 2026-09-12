@@ -33,6 +33,8 @@ export interface CompiledChatGptWebPrompt {
 export interface CompileChatGptWebPromptOptions {
   captureLunaCheckpoint?: boolean;
   experimentalMultipartParts?: ChatGptWebMultipartPartCount;
+  /** Multipart planning must try larger part counts before discarding compaction history. */
+  preserveCompactionHistory?: boolean;
   /**
    * Manual Zero Risk transport keeps ChatGPT model/effort selection and prompt submission under the
    * user's control. The browser bridge may open the owned tab and copy this prompt, but it never
@@ -383,25 +385,16 @@ function partitionMultipartRecordWeights(
  * attachments and execution instructions. Browser preflight checks the complete compiled messages
  * afterward.
  */
-function biggerContextCompiledStagesFit(
+function biggerContextCompiledMessagesFit(
   compiled: CompiledChatGptWebPrompt,
   capabilities: ChatGptWebCapabilities,
   modelId: string,
+  executionEffort: ReturnType<typeof resolveChatGptWebModelMode>["effort"],
 ): boolean {
   if (!compiled.multipart) return true;
   const stagingEffort = capabilities.proAvailable ? "max" : "medium";
-  const tokenBudget = resolveChatGptWebMessageTokenBudget(
-    CHATGPT_WEB_MODEL_ID,
-    stagingEffort,
-    capabilities,
-  );
-  const { browserComposerCharLimit } = resolveChatGptWebTransportLimits(
-    CHATGPT_WEB_MODEL_ID,
-    stagingEffort,
-    capabilities,
-  );
   const transactionId = `ctx_${"0".repeat(32)}`;
-  const stages = compiled.multipart.parts.slice(0, -1).map((payload, index) => (
+  const messages = compiled.multipart.parts.slice(0, -1).map((payload, index) => (
     formatChatGptWebMultipartStage(
       payload,
       transactionId,
@@ -409,10 +402,18 @@ function biggerContextCompiledStagesFit(
       compiled.multipart!.parts.length,
     ).text
   ));
-  return stages.every(text => (
-    estimateTokens(text, modelId) <= tokenBudget
-    && (browserComposerCharLimit === undefined || text.length <= browserComposerCharLimit)
-  ));
+  messages.push(formatChatGptWebMultipartCommit(compiled.multipart, transactionId));
+  return messages.every((text, index) => {
+    const final = index === messages.length - 1;
+    const effort = final ? executionEffort : stagingEffort;
+    const imageTokens = final
+      ? compiled.images.reduce((sum, image) => sum + chatGptWebImageTokenReserve(image.detail), 0)
+      : 0;
+    const tokenBudget = resolveChatGptWebMessageTokenBudget(CHATGPT_WEB_MODEL_ID, effort, capabilities, imageTokens);
+    const { browserComposerCharLimit } = resolveChatGptWebTransportLimits(CHATGPT_WEB_MODEL_ID, effort, capabilities);
+    return estimateTokens(text, modelId) <= tokenBudget
+      && (browserComposerCharLimit === undefined || text.length <= browserComposerCharLimit);
+  });
 }
 
 function multipartRecordFits(record: MultipartContextRecord, budget: MultipartRecordWeight): boolean {
@@ -529,7 +530,11 @@ function partitionMultipartContext(
   budgets: readonly MultipartRecordWeight[],
 ): ChatGptWebMultipartParts {
   if (budgets.length !== totalParts) throw new Error("ChatGPT multipart budget count does not match parts");
-  const splitRecords = fragmentOversizedMultipartRecords(records, budgets);
+  // Redact complete records before splitting: a retired handle can straddle two fragments.
+  const sanitizedRecords = records.map(record => (
+    JSON.parse(withoutRetiredTurnHandles(JSON.stringify(record))) as MultipartContextRecord
+  ));
+  const splitRecords = fragmentOversizedMultipartRecords(sanitizedRecords, budgets);
   const weights = splitRecords.map(multipartRecordWeight);
   const boundaries = partitionMultipartRecordWeights(weights, budgets);
   let offset = 0;
@@ -578,7 +583,8 @@ export function reconstructChatGptWebMultipartRecords(
     }
     const fragments = [...group].sort((left, right) => (left.fragment?.index ?? 0) - (right.fragment?.index ?? 0));
     const total = fragments[0]?.fragment?.total;
-    if (!total || fragments.some((record, index) => record.fragment?.index !== index + 1 || record.fragment.total !== total)) {
+    if (!Number.isInteger(total) || total !== fragments.length
+      || fragments.some((record, index) => record.fragment?.index !== index + 1 || record.fragment.total !== total)) {
       throw new Error("ChatGPT multipart reconstruction found an incomplete fragment sequence");
     }
     if (first.kind === "system") {
@@ -865,19 +871,20 @@ export function compileChatGptWebPrompt(
   const initialMessageCount = sourceMessages.length;
   let compiled = build(sourceMessages);
   if (!parsed._compactionRequest) return compiled;
+  if (compiled.multipart && options?.preserveCompactionHistory) return compiled;
 
   // Bigger Context compaction can carry more than the retired 110k-byte inline envelope, but each
-  // inert stage still has to fit one ChatGPT composer message. Trim oldest history until those
-  // stages fit the account's widest staging budget instead of failing later in browser preflight.
+  // message still has to fit its composer budget. Include the final execution instructions and
+  // attachments when trimming, not just the inert stages, to match browser preflight.
   if (compiled.multipart) {
     while (
-      !biggerContextCompiledStagesFit(compiled, capabilities, parsed.modelId)
+      !biggerContextCompiledMessagesFit(compiled, capabilities, parsed.modelId, mode.effort)
       && sourceMessages.length > 1
     ) {
       sourceMessages = sourceMessages.slice(1);
       compiled = build(sourceMessages);
     }
-    if (!biggerContextCompiledStagesFit(compiled, capabilities, parsed.modelId)) {
+    if (!biggerContextCompiledMessagesFit(compiled, capabilities, parsed.modelId, mode.effort)) {
       throw new ChatGptWebAdapterError(
         "ChatGPT Web compaction still exceeds one Bigger Context stage after all older history was trimmed; the remaining checkpoint is larger than this account's ChatGPT composer budget",
         { status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false },

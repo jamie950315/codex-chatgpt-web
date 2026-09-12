@@ -20,6 +20,7 @@ import {
 import { extractChatGptTurnIdentity } from "./environment";
 import { CHATGPT_WEB_LUNA_MODEL_ID, resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import type { BrokerToolRequest } from "./turn-broker";
+import { ChatGptWebAdapterError } from "./adapter-error";
 
 // The real capability has the same length. Keeping it out of usage accounting would make
 // estimates differ slightly between the prepared browser prompt and later Codex tool rounds.
@@ -84,7 +85,7 @@ export function resolveBiggerContextMultipartParts(
   );
   const compile = (parts?: ChatGptWebMultipartPartCount): CompiledChatGptWebPrompt => compileChatGptWebPrompt(
     parsed, capabilities, mode.localTools ? ESTIMATE_TURN_TOKEN : undefined,
-    { experimentalMultipartParts: parts },
+    { experimentalMultipartParts: parts, preserveCompactionHistory: true },
   );
   const fits = (compiled: CompiledChatGptWebPrompt): boolean => {
     const messages = compiledChatGptWebMessages(compiled);
@@ -106,8 +107,13 @@ export function resolveBiggerContextMultipartParts(
   if (parsed._compactionRequest) {
     for (let parts = CHATGPT_BIGGER_CONTEXT_PARTS; parts <= CHATGPT_BIGGER_CONTEXT_MAX_PARTS; parts += 1) {
       if (!isChatGptWebMultipartPartCount(parts)) continue;
-      if (fits(compile(parts))) return parts;
+      try {
+        if (fits(compile(parts))) return parts;
+      } catch (error) {
+        if (!(error instanceof ChatGptWebAdapterError) || error.code !== "context_length_exceeded") throw error;
+      }
     }
+    // Only the final compile at the widest supported transport may trim old history.
     return CHATGPT_BIGGER_CONTEXT_MAX_PARTS;
   }
   const inline = compile();
