@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { defaultConfig } from "../src/config";
 import {
   CHATGPT_WEB_ZERO_RISK_MODEL_ROUTE,
@@ -72,7 +75,7 @@ test("proxies official /models auth and query, then appends the fixed ChatGPT We
     expect(model.auto_compact_token_limit).toBe(limits.autoCompactTokenLimit);
     expect(model.supported_in_api).toBe(true);
     expect(model.priority).toBe(1);
-    expect(model.multi_agent_version).toBe("v2");
+    expect(model.multi_agent_version).toBe("disabled");
   }
 });
 
@@ -142,7 +145,7 @@ test("Zero Risk returns one generic Web row without using scanned capabilities",
     additional_speed_tiers: [],
     service_tiers: [],
     default_service_tier: null,
-    multi_agent_version: "v1",
+    multi_agent_version: "disabled",
   }]);
 });
 
@@ -172,4 +175,53 @@ test("ChatGPT-only native catalog rows do not turn model discovery into a 502", 
     .toHaveLength(3);
   expect(body.models.filter(model => model.slug.startsWith("chatgpt-web/"))
     .every(model => model.supported_in_api === true)).toBe(true);
+});
+
+test("native passthrough serves ChatGPT Web models from the Cockpit catalog file", async () => {
+  const originalHome = process.env.CODEX_HOME;
+  const root = join(tmpdir(), `cockpit-models-${process.pid}-${Date.now()}`);
+  mkdirSync(join(root, "codex"), { recursive: true });
+  process.env.CODEX_HOME = join(root, "codex");
+  try {
+    writeFileSync(join(root, "codex", "config.toml"), 'model_catalog_json = "cockpit-model-catalog.json"\n');
+    writeFileSync(join(root, "codex", "cockpit-model-catalog.json"), `${JSON.stringify({
+      models: [{
+        slug: "CPA/grok-4.6",
+        display_name: "Grok-4.6",
+        visibility: "list",
+        supported_in_api: true,
+        supported_reasoning_levels: [{ effort: "medium" }],
+        tool_mode: "code_mode_only",
+      }],
+    }, null, 2)}\n`);
+    const config = defaultConfig("full");
+    config.proAvailable = true;
+    config.nativePassthrough = { baseUrl: "http://127.0.0.1:57204/v1" };
+    let upstream = 0;
+    const response = await modelsRequest(
+      new Request("http://127.0.0.1:17841/v1/models", {
+        headers: { authorization: "Bearer codex-oauth-token" },
+      }),
+      config,
+      async () => {
+        upstream += 1;
+        throw new Error("Cockpit catalog must not be fetched from chatgpt.com");
+      },
+    );
+    expect(upstream).toBe(0);
+    expect(response.status).toBe(200);
+    const body = await response.json() as { models: Array<{ slug: string }> };
+    expect(body.models.map(model => model.slug)).toEqual([
+      "CPA/grok-4.6",
+      "chatgpt-web/light",
+      "chatgpt-web/medium",
+      "chatgpt-web/high",
+      "chatgpt-web/extra-high",
+      "chatgpt-web/pro",
+    ]);
+  } finally {
+    if (originalHome === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = originalHome;
+    rmSync(root, { recursive: true, force: true });
+  }
 });

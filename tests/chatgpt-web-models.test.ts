@@ -195,15 +195,20 @@ describe("fixed ChatGPT Web model routes", () => {
     });
   });
 
-  test("triples Sol context and compaction limits only when Bigger Context is enabled", () => {
-    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "max", {
-      ...pro,
-      experimentalBiggerContext: true,
-    })).toEqual({
-      contextWindow: 336_579,
-      effectiveContextWindowPercent: 85,
-      autoCompactTokenLimit: 285_000,
+  test("Bigger Context advertises Instant 128k and other efforts 400k, compacting at 90%", () => {
+    const bigger = { ...pro, experimentalBiggerContext: true };
+    expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, "low", bigger)).toEqual({
+      contextWindow: 128_000,
+      effectiveContextWindowPercent: 90,
+      autoCompactTokenLimit: 115_200,
     });
+    for (const effort of ["medium", "high", "xhigh", "max"] as const) {
+      expect(resolveChatGptWebContextLimits(CHATGPT_WEB_BACKEND_MODEL, effort, bigger)).toEqual({
+        contextWindow: 400_000,
+        effectiveContextWindowPercent: 90,
+        autoCompactTokenLimit: 360_000,
+      });
+    }
     expect(resolveChatGptWebContextLimits(CHATGPT_WEB_LUNA_BACKEND_MODEL, "low", {
       solAvailable: false,
       proAvailable: false,

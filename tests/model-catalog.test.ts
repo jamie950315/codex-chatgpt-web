@@ -70,7 +70,7 @@ describe("native /models augmentation", () => {
         tool_mode: null,
         default_reasoning_level: route.codexEffort,
         supported_reasoning_levels: [{ effort: route.codexEffort, description: route.displayName }],
-        multi_agent_version: "v2",
+        multi_agent_version: "disabled",
         supported_in_api: true,
         priority: 2,
         context_window: limits.contextWindow,
@@ -91,8 +91,9 @@ describe("native /models augmentation", () => {
     config.experimentalBiggerContext = true;
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
-    expect(pro.context_window).toBe(336_579);
-    expect(pro.auto_compact_token_limit).toBe(285_000);
+    expect(pro.context_window).toBe(400_000);
+    expect(pro.auto_compact_token_limit).toBe(360_000);
+    expect(pro.multi_agent_version).toBe("disabled");
   });
 
   test("keeps native Sol selectable in the bounded Compatibility V1 registry", () => {
@@ -108,16 +109,15 @@ describe("native /models augmentation", () => {
     const parentSurface = parent.multi_agent_version;
     const spawnOverrides = models
       .filter(model => model.supported_in_api === true && model.visibility === "list")
+      .filter(model => model.multi_agent_version !== "disabled")
       .filter(model => parentSurface !== "v2" || model.multi_agent_version === parentSurface)
       .toSorted((left, right) => Number(left.priority) - Number(right.priority))
       .slice(0, 5)
       .map(model => model.slug);
 
-    expect(spawnOverrides).toEqual([
-      "gpt-5.6-sol",
-      ...CHATGPT_WEB_MODEL_ROUTES.slice(1).map(route => route.slug),
-    ]);
-    expect(models.find(model => model.slug === "chatgpt-web/light")?.priority).toBe(3);
+    expect(spawnOverrides).toEqual(["gpt-5.6-sol"]);
+    expect(models.filter(model => String(model.slug).startsWith("chatgpt-web/"))
+      .every(model => model.multi_agent_version === "disabled")).toBe(true);
   });
 
   test("Compatibility V1 preserves an explicit native delegation disable while pinning supported rows", () => {
@@ -140,7 +140,7 @@ describe("native /models augmentation", () => {
 
     const models = augmentNativeModelCatalog(native, config).models as Array<Record<string, unknown>>;
     expect(models.slice(0, nativeModels.length)).toEqual(nativeModels);
-    expect(models.slice(nativeModels.length).every(model => model.multi_agent_version === "v2")).toBe(true);
+    expect(models.slice(nativeModels.length).every(model => model.multi_agent_version === "disabled")).toBe(true);
     const spawnOverrides = models
       .filter(model => model.supported_in_api === true && model.visibility === "list")
       .filter(model => model.multi_agent_version === "v2")
@@ -167,7 +167,7 @@ describe("native /models augmentation", () => {
       CHATGPT_WEB_MODEL_ROUTES.filter(route => !route.requiresPro).map(route => route.slug),
     );
     expect(web.every(model => model.tool_mode === null)).toBe(true);
-    expect(web.every(model => model.multi_agent_version === "v2")).toBe(true);
+    expect(web.every(model => model.multi_agent_version === "disabled")).toBe(true);
     expect(web.every(model => (model.supported_reasoning_levels as unknown[]).length === 1)).toBe(true);
     expect(web.map(model => ({
       contextWindow: model.context_window,

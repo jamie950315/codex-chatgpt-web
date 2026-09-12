@@ -12,6 +12,8 @@ import type {
   CodexToolCall,
 } from "../types";
 import { namespacedToolName } from "../types";
+import { CHATGPT_WEB_MODEL_PREFIX } from "../chatgpt-web-models";
+import { isCollaborationTool } from "../collaboration-tools";
 import { responsesRequestSchema } from "./schema";
 import { compactionItemToText } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
@@ -580,8 +582,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   const declaredTools = buildTools(data.tools as unknown[] | undefined) ?? [];
   const loadedTools = buildTools(loadedToolSpecs) ?? [];
   const seenTools = new Set<string>();
+  const webModel = typeof data.model === "string" && data.model.startsWith(CHATGPT_WEB_MODEL_PREFIX);
   const mergedTools = [...declaredTools, ...loadedTools]
     .filter(t => {
+      if (webModel && isCollaborationTool(t)) return false;
       const k = namespacedToolName(t.namespace, t.name);
       if (seenTools.has(k)) return false;
       seenTools.add(k);

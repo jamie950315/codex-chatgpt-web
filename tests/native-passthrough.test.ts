@@ -444,3 +444,61 @@ test("a non-event-stream body is passed through untouched", async () => {
 
   expect(await response.text()).toBe('{"ok":true}');
 });
+
+test("forwards non-Web models to a configured Cockpit sidecar without stripping the slug", async () => {
+  const body = JSON.stringify({ model: "CPA/grok-4.6", stream: true });
+  const request = new Request("http://127.0.0.1:17841/v1/responses", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer codex-oauth-token",
+      "content-type": "application/json",
+    },
+    body,
+  });
+  let upstreamRequest: Request | undefined;
+  await forwardNativeCodexRequest(
+    request,
+    "responses",
+    async input => {
+      upstreamRequest = input;
+      return new Response("data: cockpit\n\n", { headers: { "content-type": "text/event-stream" } });
+    },
+    undefined,
+    {
+      baseUrl: "http://127.0.0.1:57204/v1",
+      authorization: "Bearer cockpit-sidecar-token",
+      headers: {
+        "x-openai-actor-authorization": "cockpit-tools",
+        "x-cockpit-instance-id": ".codex",
+      },
+    },
+  );
+
+  expect(upstreamRequest).toBeDefined();
+  expect(upstreamRequest!.url).toBe("http://127.0.0.1:57204/v1/responses");
+  expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer cockpit-sidecar-token");
+  expect(upstreamRequest!.headers.get("x-openai-actor-authorization")).toBe("cockpit-tools");
+  expect(upstreamRequest!.headers.get("x-cockpit-instance-id")).toBe(".codex");
+  expect(await upstreamRequest!.text()).toBe(body);
+});
+
+test("forwards Cockpit model discovery to the sidecar models endpoint", async () => {
+  const request = new Request("http://127.0.0.1:17841/v1/models?client_version=0.146.0", {
+    headers: { authorization: "Bearer codex-oauth-token" },
+  });
+  let upstreamRequest: Request | undefined;
+  await forwardNativeCodexRequest(
+    request,
+    "models",
+    async input => {
+      upstreamRequest = input;
+      return Response.json({ object: "list", data: [] });
+    },
+    undefined,
+    { baseUrl: "http://127.0.0.1:57204/v1/" },
+  );
+
+  expect(upstreamRequest!.url).toBe("http://127.0.0.1:57204/v1/models?client_version=0.146.0");
+  expect(upstreamRequest!.method).toBe("GET");
+  expect(upstreamRequest!.headers.get("authorization")).toBe("Bearer codex-oauth-token");
+});

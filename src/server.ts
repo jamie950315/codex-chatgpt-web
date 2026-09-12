@@ -19,6 +19,7 @@ import { rememberCompactionContinuation } from "./adapters/chatgpt-web/compactio
 import { bridgeToResponsesSSE, buildResponseJSON, formatErrorResponse } from "./bridge";
 import type { AppConfig } from "./config";
 import { providerConfig } from "./config";
+import { existsSync, readFileSync } from "node:fs";
 import { AsyncEventQueue } from "./event-queue";
 import { readJsonRequestBody } from "./http-body";
 import { httpStatusFromTerminalError } from "./lib/errors";
@@ -35,7 +36,15 @@ import {
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
-import { forwardNativeCodexRequest, type NativeFetch, type NativeImageEndpoint } from "./native-passthrough";
+import { startCockpitModelCatalogSync, syncCockpitModelCatalog } from "./cockpit-model-catalog-sync";
+import {
+  forwardNativeCodexRequest,
+  nativePassthroughTargetFromConfig,
+  type NativeCodexEndpoint,
+  type NativeFetch,
+  type NativeImageEndpoint,
+  type NativePassthroughTarget,
+} from "./native-passthrough";
 import {
   buildCompactV1Output,
   COMPACT_PROMPT,
@@ -372,15 +381,50 @@ export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppCo
   return route;
 }
 
+function forwardConfiguredNativeCodexRequest(
+  request: Request,
+  endpoint: NativeCodexEndpoint,
+  config: AppConfig,
+  fetchUpstream?: NativeFetch,
+  decodedBody?: unknown,
+): Promise<Response> {
+  return forwardNativeCodexRequest(
+    request,
+    endpoint,
+    fetchUpstream,
+    decodedBody,
+    nativePassthroughTargetFromConfig(config),
+  );
+}
+
 export async function modelsRequest(
   req: Request,
   config: AppConfig,
   fetchUpstream?: NativeFetch,
   contextOverride?: () => CodexModelContextOverride | undefined,
 ): Promise<Response> {
+  if (config.nativePassthrough) {
+    const synced = syncCockpitModelCatalog(config);
+    if (synced.catalogPath && existsSync(synced.catalogPath)) {
+      try {
+        const catalog = augmentNativeModelCatalog(
+          JSON.parse(readFileSync(synced.catalogPath, "utf8")) as unknown,
+          config,
+          contextOverride?.(),
+        );
+        return Response.json(catalog);
+      } catch (error) {
+        return formatErrorResponse(
+          502,
+          "invalid_response_error",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }
   let upstream: Response;
   try {
-    upstream = await forwardNativeCodexRequest(req, "models", fetchUpstream);
+    upstream = await forwardConfiguredNativeCodexRequest(req, "models", config, fetchUpstream);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -403,9 +447,10 @@ export async function modelsRequest(
 export async function nativeSearchRequest(
   req: Request,
   fetchUpstream?: NativeFetch,
+  target?: NativePassthroughTarget,
 ): Promise<Response> {
   try {
-    return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream);
+    return await forwardNativeCodexRequest(req, "alpha/search", fetchUpstream, undefined, target);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -415,13 +460,14 @@ async function nativeImagesRequest(
   req: Request,
   endpoint: NativeImageEndpoint,
   fetchUpstream?: NativeFetch,
+  target?: NativePassthroughTarget,
 ): Promise<Response> {
   const authorization = req.headers.get("authorization") ?? "";
   if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
     return formatErrorResponse(401, "authentication_error", "Native image requests require incoming Codex Bearer authorization");
   }
   try {
-    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream);
+    return await forwardNativeCodexRequest(req, endpoint, fetchUpstream, undefined, target);
   } catch (error) {
     return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
   }
@@ -473,7 +519,7 @@ export async function responseRequest(
   }
   if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
     try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses", undefined, raw);
+      return await forwardConfiguredNativeCodexRequest(nativeRequest, "responses", config, undefined, raw);
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
@@ -698,7 +744,7 @@ export async function compactRequest(
   }
   if (!isChatGptWebModelSlug(raw.model)) {
     try {
-      return await forwardNativeCodexRequest(nativeRequest, "responses/compact", undefined, raw);
+      return await forwardConfiguredNativeCodexRequest(nativeRequest, "responses/compact", config, undefined, raw);
     } catch (error) {
       return formatErrorResponse(502, "upstream_error", error instanceof Error ? error.message : String(error));
     }
@@ -785,6 +831,16 @@ export function startServer(
   }
   let draining = false;
   let shutdownPromise: Promise<void> | undefined;
+  const nativeTarget = nativePassthroughTargetFromConfig(config);
+  const stopCatalogSync = config.nativePassthrough
+    ? startCockpitModelCatalogSync(config, {
+      onError(error) {
+        console.error(
+          `[codex-chatgpt-web] Cockpit model catalog sync failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    })
+    : undefined;
   let successfulModelCatalogRequests = 0;
   let lastSuccessfulModelCatalogRequestAt: string | null = null;
   const httpTurns = new HttpTurnCounter();
@@ -1015,7 +1071,7 @@ export function startServer(
       if (req.method === "POST" && url.pathname === "/v1/alpha/search") {
         if (draining) return formatErrorResponse(503, "server_error", "codex-chatgpt-web is draining for a requested service operation");
         return httpTurns.track(
-          signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream),
+          signal => nativeSearchRequest(new Request(req, { signal }), dependencies.fetchUpstream, nativeTarget),
           req.signal,
           process.platform,
           "search",
@@ -1028,7 +1084,7 @@ export function startServer(
           ? "images/generations"
           : "images/edits";
         return httpTurns.track(
-          signal => nativeImagesRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream),
+          signal => nativeImagesRequest(new Request(req, { signal }), endpoint, dependencies.fetchUpstream, nativeTarget),
           req.signal,
           process.platform,
           endpoint,
@@ -1040,6 +1096,7 @@ export function startServer(
   function shutdown(): void {
     if (shutdownPromise) return;
     draining = true;
+    stopCatalogSync?.();
     chatGptTurnSessions.clear();
     flushResponseState();
     shutdownPromise = (async () => {

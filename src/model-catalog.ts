@@ -89,9 +89,10 @@ function useCompatibilityV1SubagentSurface(model: JsonObject): void {
   if (model.multi_agent_version !== "disabled") model.multi_agent_version = "v1";
 }
 
-function routedSubagentVersion(template: JsonObject, config: AppConfig): string | undefined {
-  if (config.subagentProtocol === "compatibility-v1") return "v1";
-  return typeof template.multi_agent_version === "string" ? template.multi_agent_version : undefined;
+function routedSubagentVersion(_template: JsonObject, _config: AppConfig): string {
+  // ChatGPT Web rows stay selectable, but Codex must not advertise spawn_agent from them.
+  // Official and CPA rows keep their own multi_agent_version (V1 pin or native template).
+  return "disabled";
 }
 
 export function buildChatGptWebModel(
@@ -121,12 +122,8 @@ export function buildChatGptWebModel(
     // spawn-agent overrides; forcing every routed row to priority 0 displaced gpt-5.6-sol from that
     // registry and made an explicit native child model fail validation.
     ...(priority === undefined ? {} : { priority }),
-    // In native mode the routed row follows the official template's protocol surface. Web-origin
-    // V2 collaboration calls carry the protocol's explicit plaintext marker; Compatibility V1
-    // instead pins the entire catalog and Codex feature override to V1.
-    ...(multiAgentVersion === undefined
-      ? {}
-      : { multi_agent_version: multiAgentVersion }),
+    // Keep Web rows out of spawn_agent. Official/CPA rows retain their own protocol surface.
+    multi_agent_version: multiAgentVersion,
     // Code mode collapses the outer registry into an exec gateway; routed models need the regular
     // Responses tool surface so MCP namespaces, deferred tool_search, and custom tools reach us.
     tool_mode: null,

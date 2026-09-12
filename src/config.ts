@@ -95,6 +95,17 @@ export interface AppConfig {
   tunnel?: TunnelConfig;
   automaticTunnel?: TunnelConfig;
   manualTunnel?: TunnelConfig;
+  /**
+   * Forward non-ChatGPT-Web Codex traffic to a loopback sidecar (Cockpit Tools)
+   * instead of chatgpt.com. The bearer token stays in an owner-only file.
+   */
+  nativePassthrough?: NativePassthroughConfig;
+}
+
+export interface NativePassthroughConfig {
+  baseUrl: string;
+  bearerTokenFile?: string;
+  headers?: Record<string, string>;
 }
 
 export function tunnelConfigForInteractionMode(
@@ -122,6 +133,10 @@ export function getConfigDir(): string {
 
 export function getConfigPath(): string {
   return join(getConfigDir(), "config.json");
+}
+
+export function defaultNativePassthroughTokenPath(): string {
+  return join(getConfigDir(), "secrets", "native-passthrough.key");
 }
 
 export function isWindowsPipeEndpoint(value: string): boolean {
@@ -363,6 +378,52 @@ export function loadConfigForSetup(): AppConfig {
   return parseConfig(raw, path);
 }
 
+function parseNativePassthroughConfig(value: unknown, path: string): NativePassthroughConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Invalid nativePassthrough in ${path}`);
+  }
+  const parsed = value as Partial<NativePassthroughConfig>;
+  if (typeof parsed.baseUrl !== "string" || !parsed.baseUrl.trim()) {
+    throw new Error(`Invalid nativePassthrough.baseUrl in ${path}`);
+  }
+  let url: URL;
+  try {
+    url = new URL(parsed.baseUrl);
+  } catch {
+    throw new Error(`Invalid nativePassthrough.baseUrl in ${path}`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`nativePassthrough.baseUrl must be http(s) in ${path}`);
+  }
+  if (url.hostname !== "127.0.0.1" && url.hostname !== "localhost") {
+    throw new Error(`nativePassthrough.baseUrl must be loopback in ${path}`);
+  }
+  if (parsed.bearerTokenFile !== undefined) {
+    if (typeof parsed.bearerTokenFile !== "string"
+      || !isAbsolute(expandUserPath(parsed.bearerTokenFile))) {
+      throw new Error(`nativePassthrough.bearerTokenFile must be absolute in ${path}`);
+    }
+  }
+  let headers: Record<string, string> | undefined;
+  if (parsed.headers !== undefined) {
+    if (!parsed.headers || typeof parsed.headers !== "object" || Array.isArray(parsed.headers)) {
+      throw new Error(`Invalid nativePassthrough.headers in ${path}`);
+    }
+    headers = {};
+    for (const [name, headerValue] of Object.entries(parsed.headers)) {
+      if (typeof headerValue !== "string" || !name.trim()) {
+        throw new Error(`Invalid nativePassthrough.headers in ${path}`);
+      }
+      headers[name] = headerValue;
+    }
+  }
+  return {
+    baseUrl: parsed.baseUrl.replace(/\/+$/, ""),
+    ...(parsed.bearerTokenFile ? { bearerTokenFile: resolve(expandUserPath(parsed.bearerTokenFile)) } : {}),
+    ...(headers ? { headers } : {}),
+  };
+}
+
 function parseConfig(value: unknown, path: string): AppConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid configuration object in ${path}`);
   const parsed = value as Partial<AppConfig>;
@@ -496,6 +557,9 @@ function parseConfig(value: unknown, path: string): AppConfig {
   if (parsed.stallTimeoutSec !== undefined
     && (!Number.isFinite(parsed.stallTimeoutSec) || parsed.stallTimeoutSec <= 0)) {
     throw new Error(`Invalid stallTimeoutSec in ${path}`);
+  }
+  if (parsed.nativePassthrough !== undefined) {
+    parsed.nativePassthrough = parseNativePassthroughConfig(parsed.nativePassthrough, path);
   }
   const solAvailable = parsed.solAvailable !== false;
   const proAvailable = parsed.proAvailable === true;

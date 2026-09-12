@@ -1,3 +1,7 @@
+import { readFileSync, statSync } from "node:fs";
+import { resolve } from "node:path";
+import type { AppConfig } from "./config";
+import { expandUserPath } from "./config";
 import { readJsonRequestBody } from "./http-body";
 import {
   BRIDGE_COMPACTION_PREFIX,
@@ -29,6 +33,44 @@ const HOP_BY_HOP_HEADERS = new Set([
 export type NativeFetch = (request: Request) => Promise<Response>;
 export type NativeImageEndpoint = "images/generations" | "images/edits";
 export type NativeCodexEndpoint = "models" | "responses" | "responses/compact" | "alpha/search" | NativeImageEndpoint;
+
+/** Optional local sidecar that should receive non-Web Codex traffic instead of chatgpt.com. */
+export type NativePassthroughTarget = {
+  baseUrl: string;
+  authorization?: string;
+  headers?: Record<string, string>;
+};
+
+function nativeCodexBackendUrl(
+  endpoint: NativeCodexEndpoint,
+  search: string,
+  target?: NativePassthroughTarget,
+): string {
+  const base = (target?.baseUrl ?? CODEX_BACKEND).replace(/\/+$/, "");
+  return `${base}/${endpoint}${search}`;
+}
+
+export function nativePassthroughTargetFromConfig(config: AppConfig): NativePassthroughTarget | undefined {
+  const spec = config.nativePassthrough;
+  if (!spec) return undefined;
+  return {
+    baseUrl: spec.baseUrl,
+    ...(spec.bearerTokenFile ? { authorization: `Bearer ${readNativePassthroughBearer(spec.bearerTokenFile)}` } : {}),
+    ...(spec.headers ? { headers: spec.headers } : {}),
+  };
+}
+
+function readNativePassthroughBearer(pathValue: string): string {
+  const path = resolve(expandUserPath(pathValue));
+  const stat = statSync(path);
+  if (!stat.isFile()) throw new Error("Native passthrough token path is not a file");
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error("Native passthrough token file must be readable only by its owner");
+  }
+  const token = readFileSync(path, "utf8").trim();
+  if (!token || token.length > 4096) throw new Error("Native passthrough token is invalid");
+  return token;
+}
 
 type JsonObject = Record<string, unknown>;
 type BridgeCompactionItem = JsonObject & { type: "compaction"; encrypted_content: string };
@@ -209,6 +251,7 @@ export async function forwardNativeCodexRequest(
   endpoint: NativeCodexEndpoint,
   fetchUpstream: NativeFetch = fetch,
   decodedBody?: unknown,
+  target?: NativePassthroughTarget,
 ): Promise<Response> {
   const authorization = request.headers.get("authorization") ?? "";
   if (!authorization.startsWith("Bearer ") || authorization.length <= "Bearer ".length) {
@@ -221,6 +264,12 @@ export async function forwardNativeCodexRequest(
     if (clientVersion) incomingUrl.searchParams.set("client_version", clientVersion);
   }
   const headers = endToEndHeaders(request.headers);
+  if (target?.authorization) headers.set("authorization", target.authorization);
+  if (target?.headers) {
+    for (const [name, value] of Object.entries(target.headers)) {
+      if (value.trim()) headers.set(name, value);
+    }
+  }
   if (endpoint === "models") headers.delete("if-none-match");
   const method = endpoint === "models" ? "GET" : "POST";
   const imageRequest = endpoint === "images/generations" || endpoint === "images/edits";
@@ -249,7 +298,7 @@ export async function forwardNativeCodexRequest(
       body = originalBody;
     }
   }
-  const upstreamRequest = new Request(`${CODEX_BACKEND}/${endpoint}${incomingUrl.search}`, {
+  const upstreamRequest = new Request(nativeCodexBackendUrl(endpoint, incomingUrl.search, target), {
     method,
     headers,
     ...(body ? { body } : {}),
