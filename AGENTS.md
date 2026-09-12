@@ -18,6 +18,7 @@ This project runs Codex requests through an authenticated ChatGPT browser sessio
 - Token counting reuses identical chunk counts only within a single call, with bounded storage. Preserve exact counting and surrogate-pair boundaries.
 - Windows indexed-rollout namespace cases use separate tests and transactional database fixtures. Verify all four on Windows CI; macOS skips them.
 - Check the actual upstream PR runs after pushing, not just manually dispatched fork CI. All OS checks and actionlint must pass before claiming the PR checks are fixed.
+- On 2026-09-13 the updated Draft PRs #460–#463 passed all 16 latest PR checks (macOS, Windows, Linux, actionlint). The Windows fixture follow-up batches shared SQLite setup into one durable transaction instead of four; it preserves the existing five-second test deadlines and authority assertions. This fixture change is in the clean PR worktrees, not the installed runtime.
 
 ## Review hardening (local branch)
 
