@@ -18,6 +18,14 @@ This project runs Codex requests through an authenticated ChatGPT browser sessio
 - Windows indexed-rollout namespace cases use separate tests and transactional database fixtures. Verify all four on Windows CI; macOS skips them.
 - Check the actual upstream PR runs after pushing, not just manually dispatched fork CI. All OS checks and actionlint must pass before claiming the PR checks are fixed.
 
+## Review hardening (local branch)
+
+- Compaction plans full history across 3–8 parts before trimming; every message, including the final instructions and attachments, must fit. Redact retired handles before fragmentation and reject missing fragments during reconstruction validation.
+- Web sub-agent filtering is namespace-aware, including current `collaboration-optimize` gateway names. Preserve unrelated services' same-named tools; direct and raw gateway calls must apply the same exclusions.
+- Cockpit catalogs respect actual account capabilities and fall back to sidecar discovery when local catalog reading fails. Search and image requests resolve credentials per request. Stopping the server stops catalog reconciliation.
+- Package smoke uses asynchronous child lifecycle handling and exact installed executable paths for Windows cleanup; never terminate all processes by image name.
+- These review changes are local source changes until explicitly published/installed. Isolated tests do not prove real ChatGPT browser turns or Windows-native process cleanup; retain that distinction when reporting verification.
+
 ## Communication
 
 Reply in Traditional Chinese. Keep README files in English unless requested otherwise. Do not open new upstream PRs or post comments without a request.
