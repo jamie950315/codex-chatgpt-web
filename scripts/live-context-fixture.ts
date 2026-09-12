@@ -61,6 +61,13 @@ export function validateLiveContextFixture(value: unknown): ReturnType<typeof ma
   return { ...candidate, payloadTokens: candidate.content.reduce((sum, text) => sum + estimateTokens(text), 0) };
 }
 
+export function selectLiveContextRecords(fixture: ReturnType<typeof makeLiveContextFixture>, start: number, end: number) {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end > 8 || start > end) throw new Error("Invalid record range");
+  const content = fixture.content.slice(start - 1, end);
+  return { content, expected: fixture.expected.filter(item => item.record >= start && item.record <= end),
+    payloadTokens: content.reduce((sum, text) => sum + estimateTokens(text), 0) };
+}
+
 export function extractLiveContextAnswer(result: { output?: any[] }, compaction: boolean): string {
   const items = compaction ? (result.output ?? []).slice(-1) : (result.output ?? []);
   return items.flatMap(item => {

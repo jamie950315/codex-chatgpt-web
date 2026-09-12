@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { makeLiveContextFixture, validateLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence } from "../scripts/live-context-fixture";
 import { SUMMARY_PREFIX, encodeCompactionSummary } from "../src/responses/compaction";
 
 test("live context fixtures put unique independent checkpoints across all records", () => {
@@ -21,6 +21,15 @@ test("matched experiments reuse identical valid data and reject corrupted checkp
   const corrupted = structuredClone(fixture);
   corrupted.expected[0]!.marker = "word";
   expect(() => validateLiveContextFixture(corrupted)).toThrow("Invalid matched checkpoint");
+});
+
+test("bounded extraction preserves source values and scores only the selected records", () => {
+  const original = makeLiveContextFixture("words", 100);
+  const selected = selectLiveContextRecords(original, 3, 4);
+  expect(selected.content).toEqual(original.content.slice(2, 4));
+  expect(selected.expected).toHaveLength(6);
+  expect(selected.expected.map(item => item.record)).toEqual([3, 3, 3, 4, 4, 4]);
+  expect(() => selectLiveContextRecords(original, 0, 2)).toThrow("Invalid record range");
 });
 
 test("live compaction grading never counts echoed input as newly recalled data", () => {

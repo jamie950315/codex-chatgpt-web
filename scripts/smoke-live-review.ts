@@ -5,7 +5,7 @@ import { loadConfig } from "../src/config";
 import { startServer } from "../src/server";
 import { createChatGptWebAdapter } from "../src/adapters/chatgpt-web";
 import { closeChatGptBrowserWorkers } from "../src/adapters/chatgpt-web/browser-worker";
-import { makeLiveContextFixture, validateLiveContextFixture, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind } from "./live-context-fixture";
+import { makeLiveContextFixture, validateLiveContextFixture, selectLiveContextRecords, scoreLiveContextOutput, extractLiveContextAnswer, liveDiagnosticEvidence, type FixtureKind } from "./live-context-fixture";
 import { resolveBiggerContextMultipartParts } from "../src/adapters/chatgpt-web/usage";
 import { compileChatGptWebPrompt } from "../src/adapters/chatgpt-web/prompt";
 import { compiledChatGptWebMessages, estimateCompiledChatGptWebInputTokens } from "../src/adapters/chatgpt-web/input-tokens";
@@ -28,13 +28,22 @@ const root = resolve("runtime", `live-review-${scenario}-${Date.now()}-${randomU
 mkdirSync(root, { recursive: true, mode: 0o700 });
 process.env.CODEX_CHATGPT_WEB_HOME = root;
 let helper = resolve("launcher/build/runtime/app/browser-helper.cjs");
-if (stagingPolicy !== "auto") {
+if (stagingPolicy !== "auto" || process.env.CGW_LIVE_NETWORK_TRACE === "1") {
   // Experimental control, not a production change: vary only staging effort in an isolated build.
   const workerPath = resolve("src/adapters/chatgpt-web/browser-worker.ts");
   const original = readFileSync(workerPath, "utf8");
   const needle = 'const efforts: readonly ChatGptWebModelMode["effort"][] = capabilities.proAvailable\n    ? ["low", "medium", "max"]\n    : ["low", "medium"];';
   if (original.split(needle).length !== 2) throw new Error("Staging experiment source no longer matches");
-  const variant = original.replace(needle, `const efforts: readonly ChatGptWebModelMode["effort"][] = [${JSON.stringify(stagingPolicy)}];`);
+  let variant = stagingPolicy === "auto" ? original
+    : original.replace(needle, `const efforts: readonly ChatGptWebModelMode["effort"][] = [${JSON.stringify(stagingPolicy)}];`);
+  if (process.env.CGW_LIVE_NETWORK_TRACE === "1") {
+    const points = ["\n    let diagnosticPage: Page | undefined;\n", "\n      diagnosticPage = page;\n", "\n      prepared.release();\n"];
+    if (points.some(point => variant.split(point).length !== 2)) throw new Error("Network observer injection points changed");
+    variant = `import { attachLiveNetworkObserver } from ${JSON.stringify(resolve("scripts/live-network-observer.ts"))};\n` + variant;
+    variant = variant.replace(points[0]!, points[0] + "\n    let stopLiveObserver: (() => Promise<void>) | undefined;");
+    variant = variant.replace(points[1]!, points[1] + `\n      stopLiveObserver = attachLiveNetworkObserver(page, ${JSON.stringify(join(root, "network.jsonl"))}, [...(multipartStages ?? []).map(stage => stage.text), multipartFinalPrompt ?? prepared.text]);`);
+    variant = variant.replace(points[2]!, "      await stopLiveObserver?.();\n" + points[2]);
+  }
   writeFileSync(join(root, "variant-browser-worker.ts"), variant, { mode: 0o600 });
   const build = await Bun.build({ entrypoints: [resolve("src/adapters/chatgpt-web/browser-helper-main.ts")],
     target: "node", format: "cjs", minify: true, packages: "external", external: ["playwright-core"],
@@ -47,9 +56,14 @@ if (stagingPolicy !== "auto") {
   helper = join(root, "browser-helper.cjs");
 }
 const helperHash = createHash("sha256").update(readFileSync(helper)).digest("hex");
-const fixture = process.env.CGW_LIVE_FIXTURE
+let fixture = process.env.CGW_LIVE_FIXTURE
   ? validateLiveContextFixture(JSON.parse(readFileSync(process.env.CGW_LIVE_FIXTURE, "utf8")))
   : makeLiveContextFixture(kind, scenario === "short" ? 1 : wordsPerRecord);
+if (process.env.CGW_LIVE_RECORD_RANGE) {
+  const range = process.env.CGW_LIVE_RECORD_RANGE.split(":").map(Number);
+  if (range.length !== 2) throw new Error("Invalid record range");
+  fixture = selectLiveContextRecords(fixture, range[0]!, range[1]!);
+}
 const fixtureHash = createHash("sha256").update(JSON.stringify(fixture.content)).digest("hex");
 let compiledEvidence: Record<string, unknown> = {};
 const server = startServer({
@@ -92,7 +106,7 @@ const input = scenario === "short" ? [message(envelope), message("Return exactly
   : [
     ...fixture.content.map(message),
     message(envelope),
-    message("Copy ALL 24 distinct checkpoint tokens from the eight records verbatim, including HEAD, MID and TAIL from every record. These tokens are the only important facts. Preserve them in the summary if summarizing. Do not use tools. If a token is not visible, say MISSING instead of guessing. Do not omit early records."),
+    message(`Copy ALL ${fixture.expected.length} distinct checkpoint tokens from the supplied records verbatim, including HEAD, MID and TAIL from every record. These tokens are the only important facts. Preserve them in the summary if summarizing. Do not use tools. If a token is not visible, say MISSING instead of guessing. Do not omit early records.`),
   ];
 const body = { model, stream: false,
   client_metadata: { "x-codex-turn-metadata": JSON.stringify(metadata) }, input };
