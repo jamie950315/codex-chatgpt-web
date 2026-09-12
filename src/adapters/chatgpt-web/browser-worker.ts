@@ -2058,9 +2058,10 @@ export function assertChatGptContextFileInputWithinLimits(
   capabilities: ChatGptWebCapabilities,
 ): void {
   assertChatGptContextFile(prompt.contextFile);
-  if (prompt.multipart || modelId !== CHATGPT_WEB_MODEL_ID || effort !== "max" || !capabilities.proAvailable) {
-    throw new Error("Context-file transport is available only for automatic ChatGPT Pro");
+  if (prompt.multipart || modelId !== CHATGPT_WEB_MODEL_ID) {
+    throw new Error("Context-file transport is available only for automatic ChatGPT Sol modes");
   }
+  resolveChatGptWebModelMode(modelId, effort, capabilities);
   if (prompt.images.length + 1 > CHATGPT_MAX_INPUT_IMAGES) throw new Error("ChatGPT context file exceeds the attachment count limit");
   // The composer budget applies to the small instruction message, while total usage includes the file.
   assertChatGptWebInputWithinLimits(
@@ -2068,8 +2069,10 @@ export function assertChatGptContextFileInputWithinLimits(
     estimateCompiledChatGptWebMessageTokens(prompt, modelId), modelId, effort, capabilities, prompt.text.length,
   );
   const total = estimateCompiledChatGptWebInputTokens(prompt, modelId);
-  if (total > prompt.contextFile.maxInputTokens) {
-    throw new ChatGptWebAdapterError(`Context-file input requires ${total} estimated tokens; maximum ${prompt.contextFile.maxInputTokens}. Compact before retrying.`, {
+  const ceiling = Math.min(prompt.contextFile.maxInputTokens, resolveChatGptWebContextLimits(modelId, effort,
+    { ...capabilities, experimentalBiggerContext: true, biggerContextPlan: "pro" }).contextWindow);
+  if (total > ceiling) {
+    throw new ChatGptWebAdapterError(`Context-file input requires ${total} estimated tokens; maximum ${ceiling}. Compact before retrying.`, {
       status: 400, errorType: "invalid_request_error", code: "context_length_exceeded", retryable: false,
     });
   }

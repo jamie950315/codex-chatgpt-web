@@ -1206,7 +1206,7 @@ test("a compact HTTP observer can reconnect without sending a second retained-ch
   }
 });
 
-test.each(["inline", "multipart", "file"])("structured compact rebuilds canonical context when its retained source is absent (%s)", async transport => {
+test.each(["inline", "small-bigger", "file"])("structured compact rebuilds canonical context when its retained source is absent (%s)", async transport => {
   const experimentalBiggerContext = transport !== "inline";
   const root = mkdtempSync(join(shortSocketTempRoot(), "cgw-missing-retained-compact-"));
   const provider: CodexProviderConfig = {
@@ -1241,10 +1241,9 @@ test.each(["inline", "multipart", "file"])("structured compact rebuilds canonica
       expect(prepared.trimmedCompactionMessages).toBeUndefined();
       expect(JSON.parse(prepared.contextFile!.content).messages.at(-1).content).toBe(compact.context.messages.at(-1)!.content);
     } else if (experimentalBiggerContext) {
-      expect(prepared.multipart!.parts).toHaveLength(3);
+      expect(prepared.multipart).toBeUndefined();
       expect(prepared.trimmedCompactionMessages).toBeUndefined();
-      const lastRecord = prepared.multipart!.parts.flatMap(part => JSON.parse(part).records).at(-1);
-      expect(lastRecord.message.content).toBe(compact.context.messages.at(-1)!.content);
+      expect(prepared.text).toContain(compact.context.messages.at(-1)!.content as string);
     }
     prepared.release();
     return "Fallback checkpoint from canonical Codex context";

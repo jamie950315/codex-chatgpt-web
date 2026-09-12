@@ -368,7 +368,8 @@ describe("ChatGPT outer-native harness v4", () => {
     }
   });
 
-  test.each([false, true])("sequential native messages retain ordinary chats but rehydrate Pro files (file=%s)", async fileMode => {
+  test.each([undefined, "low", "medium", "high", "xhigh", "max"])("sequential native messages retain ordinary chats but rehydrate files (effort=%s)", async fileEffort => {
+    const fileMode = fileEffort !== undefined;
     const socketPath = brokerTestEndpoint(`cgw-retained-messages-${process.pid}-${Date.now()}`);
     const provider: CodexProviderConfig = {
       adapter: "chatgpt-web",
@@ -413,8 +414,9 @@ describe("ChatGPT outer-native harness v4", () => {
     const first = rawWireRequest(environmentXml);
     const second = parsed();
     if (fileMode) {
-      first.options.reasoning = second.options.reasoning = "max";
-      first.context.systemPrompt = [...first.context.systemPrompt ?? [], "file-history-head " + "word ".repeat(140_000) + " file-history-tail"];
+      first.options.reasoning = second.options.reasoning = fileEffort;
+      const filler = fileEffort === "low" ? " information".repeat(60_000) : "word ".repeat(140_000);
+      first.context.systemPrompt = [...first.context.systemPrompt ?? [], "file-history-head " + filler + " file-history-tail"];
       second.context.systemPrompt = [...first.context.systemPrompt];
     }
     second.context.messages = [

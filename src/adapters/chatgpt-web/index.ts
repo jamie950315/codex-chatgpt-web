@@ -421,8 +421,8 @@ export function createChatGptWebAdapter(
         ...resolveChatGptWebCompileOptions(input, turnCapabilities, experimentalBiggerContext, biggerContextPlan),
       };
     };
-    // Pro file conversations lose tool access on the next web message, and the retained
-    // composer cannot reselect the connector. Rehydrate the full canonical context in a
+    // Retained Pro file tests lost tool access on the next web message and could not
+    // reselect the connector. All file modes rehydrate the full canonical context in a
     // fresh tab per native turn. Tool-result rounds still share this runtime/broker.
     const freshContextFileTurn = compileOptionsFor(checkpointInput.parsed).contextFile === true;
     const conversationKey = !parsed._compactionRequest

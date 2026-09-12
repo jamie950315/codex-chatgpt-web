@@ -4,8 +4,8 @@ import {
   isChatGptWebZeroRiskBackendModel,
   resolveChatGptWebMessageTokenBudget,
   resolveChatGptWebTransportLimits,
+  resolveChatGptWebContextLimits,
   CHATGPT_WEB_PLATFORM_RESERVE_TOKENS,
-  CHATGPT_WEB_BIGGER_CONTEXT_STANDARD_WINDOW,
 } from "../../chatgpt-web-models";
 import { ChatGptWebAdapterError } from "./adapter-error";
 import { estimateTokens } from "../../lib/token-estimate";
@@ -646,9 +646,8 @@ export function compileChatGptWebPrompt(
   const multipartParts = options?.experimentalMultipartParts;
   const multipartEnabled = multipartParts !== undefined;
   const contextFileEnabled = options?.contextFile === true;
-  if (contextFileEnabled && (manualControl || multipartEnabled || mode.effort !== "max"
-    || parsed.modelId !== CHATGPT_WEB_MODEL_ID || !capabilities.proAvailable)) {
-    throw new Error("Context-file transport requires automatic ChatGPT Pro and cannot be combined with multipart transport");
+  if (contextFileEnabled && (manualControl || multipartEnabled || parsed.modelId !== CHATGPT_WEB_MODEL_ID)) {
+    throw new Error("Context-file transport requires an automatic ChatGPT Sol mode and cannot be combined with multipart transport");
   }
   if (manualControl) {
     if (!capabilities.localToolsEnabled) {
@@ -874,7 +873,9 @@ export function compileChatGptWebPrompt(
     }
     const envelopeJson = withoutRetiredTurnHandles(JSON.stringify({ version: 3, system, messages }));
     if (contextFileEnabled) {
-      const contextFile = createChatGptContextFile(envelopeJson, options?.contextFileTokenLimit ?? CHATGPT_WEB_BIGGER_CONTEXT_STANDARD_WINDOW);
+      const modeCeiling = resolveChatGptWebContextLimits(CHATGPT_WEB_MODEL_ID, mode.effort,
+        { ...capabilities, experimentalBiggerContext: true, biggerContextPlan: "pro" }).contextWindow;
+      const contextFile = createChatGptContextFile(envelopeJson, Math.min(options?.contextFileTokenLimit ?? modeCeiling, modeCeiling));
       const text = [
         ...sharedContract, ...transportContract, ...outputControlContract, ...manualControlContract, ...checkpointContract,
         answerContract,

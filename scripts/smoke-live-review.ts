@@ -18,7 +18,7 @@ if (!["short", "compaction", "recall"].includes(scenario)) throw new Error("Expe
 const wordsPerRecord = Number(process.argv[3] ?? 40_000);
 if (!Number.isInteger(wordsPerRecord) || wordsPerRecord < 1 || wordsPerRecord > 50_000) throw new Error("Invalid record size");
 const model = process.argv[4] ?? (scenario === "short" ? "chatgpt-web/light" : "chatgpt-web/medium");
-if (!["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/pro"].includes(model)) throw new Error("Invalid model");
+if (!["chatgpt-web/light", "chatgpt-web/medium", "chatgpt-web/high", "chatgpt-web/extra-high", "chatgpt-web/pro"].includes(model)) throw new Error("Invalid model");
 const kind = (process.argv[5] ?? "words") as FixtureKind;
 if (!["words", "code", "chinese"].includes(kind)) throw new Error("Invalid fixture kind");
 const stagingPolicy = process.argv[6] ?? "auto";

@@ -63,7 +63,7 @@ export function estimateChatGptWebInputTokens(
   return estimateCompiledChatGptWebInputTokens(compiled, parsed.modelId);
 }
 
-/** One shared choice for preparation and accounting; other models keep their existing transport. */
+/** One shared file/inline choice for automatic Sol modes and their accounting. */
 export function resolveChatGptWebCompileOptions(
   parsed: CodexParsedRequest,
   capabilities: ChatGptWebCapabilities,
@@ -71,14 +71,14 @@ export function resolveChatGptWebCompileOptions(
   biggerContextPlan: BiggerContextPlan = "plus",
 ): CompileChatGptWebPromptOptions {
   if (!experimentalBiggerContext) return {};
-  if (parsed.modelId === CHATGPT_WEB_BACKEND_MODEL && capabilities.proAvailable
-    && resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities).effort === "max") {
+  if (parsed.modelId === CHATGPT_WEB_BACKEND_MODEL) {
+    const { effort } = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
     const inline = compileChatGptWebPrompt(parsed, capabilities, capabilities.localToolsEnabled ? ESTIMATE_TURN_TOKEN : undefined,
       { preserveCompactionHistory: true });
-    const budget = resolveChatGptWebMessageTokenBudget(parsed.modelId, "max", capabilities, estimateChatGptWebImageTokens(inline));
-    const chars = resolveChatGptWebTransportLimits(parsed.modelId, "max", capabilities).browserComposerCharLimit ?? Infinity;
+    const budget = resolveChatGptWebMessageTokenBudget(parsed.modelId, effort, capabilities, estimateChatGptWebImageTokens(inline));
+    const chars = resolveChatGptWebTransportLimits(parsed.modelId, effort, capabilities).browserComposerCharLimit ?? Infinity;
     if (estimateTokens(inline.text) <= budget && inline.text.length <= chars) return { preserveCompactionHistory: true };
-    const limit = resolveChatGptWebContextLimits(parsed.modelId, "max", { ...capabilities, experimentalBiggerContext: true, biggerContextPlan }).contextWindow;
+    const limit = resolveChatGptWebContextLimits(parsed.modelId, effort, { ...capabilities, experimentalBiggerContext: true, biggerContextPlan }).contextWindow;
     return { contextFile: true, contextFileTokenLimit: limit, preserveCompactionHistory: true };
   }
   return { experimentalMultipartParts: resolveBiggerContextMultipartParts(parsed, capabilities) };
