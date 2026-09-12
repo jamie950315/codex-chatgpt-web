@@ -258,7 +258,7 @@ test("multipart redacts retired handles before a fragment boundary can bisect th
   expect(first.fragment.index).toBe(1);
   const boundary = first.payload.length - first.payload.indexOf(content.slice(0, 30));
   const handle = `turn_${"A".repeat(32)}`;
-  const withHandle = content.slice(0, boundary - 2) + handle + content.slice(boundary - 2 + handle.length);
+  const withHandle = content.slice(0, boundary - 2) + " " + handle + " " + content.slice(boundary + handle.length);
   parsed.context.messages = [{ role: "user", content: withHandle, timestamp: 1 }];
   const compiled = compileChatGptWebPrompt(parsed, caps, undefined, options);
   const reconstructed = reconstructChatGptWebMultipartRecords(compiled.multipart!.parts);

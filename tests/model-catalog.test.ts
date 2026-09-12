@@ -85,6 +85,17 @@ describe("native /models augmentation", () => {
     }
   });
 
+  test("defaults to conservative Plus budgets even on a Pro-capable account", () => {
+    const config = defaultConfig("full");
+    config.proAvailable = true;
+    config.experimentalBiggerContext = true;
+    const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    expect(models.find(model => model.slug === "chatgpt-web/light")!.context_window).toBe(123_000);
+    const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
+    expect(pro.context_window).toBe(270_000);
+    expect(pro.auto_compact_token_limit).toBe(240_000);
+  });
+
   test("publishes Bigger Context limits in the Codex model catalog", () => {
     const config = defaultConfig("full");
     config.proAvailable = true;

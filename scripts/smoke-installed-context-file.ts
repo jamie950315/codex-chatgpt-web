@@ -8,7 +8,9 @@ import { allowWebOnlySmokeRequest, WEB_ONLY_SMOKE_MODELS } from "./web-only-requ
 const model = process.argv[2] ?? "chatgpt-web/pro";
 if (!WEB_ONLY_SMOKE_MODELS.includes(model)) throw new Error("Only explicit ChatGPT Web automatic modes are allowed");
 const instant = model === "chatgpt-web/light";
-const backend = "http://127.0.0.1:17841";
+const backend = process.env.CGW_SMOKE_BACKEND ?? "http://127.0.0.1:17841";
+const codexExecutable = process.env.CGW_SMOKE_CODEX_EXECUTABLE
+  ?? (process.platform === "darwin" ? "/Applications/ChatGPT.app/Contents/Resources/codex" : "codex");
 const root = resolve("runtime", `installed-file-smoke-${Date.now()}`);
 const catalogRoot = join(root, "catalog");
 // Resume authority is verified against the same native rollout home used by the installed server.
@@ -52,7 +54,7 @@ writeFileSync(join(root, "expected.json"), JSON.stringify({ head, tail, toolOne,
 async function run(label: string, prompt: string, thread?: string) {
   const args = ["exec", ...clientConfig, ...(thread ? ["resume", thread] : ["--sandbox", "read-only", "--skip-git-repo-check"]),
     "--json", "--model", model, "--output-last-message", join(root, `${label}-answer.txt`), "-"];
-  const child = Bun.spawn(["/Applications/ChatGPT.app/Contents/Resources/codex", ...args], {
+  const child = Bun.spawn([codexExecutable, ...args], {
     cwd: process.cwd(), env: { ...process.env, CODEX_HOME: clientHome, CGW_LOCAL_TEST_KEY: "web-only-test" },
     stdin: "pipe", stdout: "pipe", stderr: "pipe",
   });
