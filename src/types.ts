@@ -303,7 +303,7 @@ export interface CodexProviderConfig {
     autoApproveToolCalls?: boolean;
     /** DEV-only experimental transport: adapt one context across one, two, or three ChatGPT messages. */
     experimentalBiggerContext?: boolean;
-    /** Plus keeps original 3× windows; Pro uses Instant 128k / 400k when Bigger Context is on. */
+    /** Plus keeps original 3× windows; Pro uses Instant 123k / 400k when Bigger Context is on. */
     biggerContextPlan?: "plus" | "pro";
     /** When true, ChatGPT Web models may spawn Codex sub-agents. Default false. */
     allowWebSubagents?: boolean;

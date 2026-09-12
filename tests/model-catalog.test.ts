@@ -91,7 +91,10 @@ describe("native /models augmentation", () => {
     config.experimentalBiggerContext = true;
     config.biggerContextPlan = "pro";
     const models = augmentNativeModelCatalog(source(), config).models as Array<Record<string, unknown>>;
+    const instant = models.find(model => model.slug === "chatgpt-web/light")!;
     const pro = models.find(model => model.slug === "chatgpt-web/pro")!;
+    expect(instant.context_window).toBe(123_000);
+    expect(instant.auto_compact_token_limit).toBe(110_700);
     expect(pro.context_window).toBe(400_000);
     expect(pro.auto_compact_token_limit).toBe(360_000);
     expect(pro.multi_agent_version).toBe("disabled");
